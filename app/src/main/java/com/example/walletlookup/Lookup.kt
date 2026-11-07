@@ -568,12 +568,18 @@ internal fun solanaCall(method: String, params: JSONArray): JSONObject {
     var last: Exception? = null
     // publicnode answers in well under a second; Solana's own public node is slow and often refuses, so it's the backup.
     for (url in listOf("https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com")) {
-        try {
-            val r = JSONObject(http(url, body))
-            r.optJSONObject("error")?.let { throw IOException(it.optString("message")) }
-            return r
-        } catch (e: Exception) {
-            last = e
+        // A "Too many requests" refusal is asked once more after a short pause before moving on to the backup.
+        for (attempt in 0..1) {
+            try {
+                val r = JSONObject(http(url, body))
+                r.optJSONObject("error")?.let { throw IOException(it.optString("message")) }
+                return r
+            } catch (e: Exception) {
+                last = e
+                val limited = e.message.orEmpty().let { "429" in it || it.contains("too many", ignoreCase = true) }
+                if (!limited || attempt == 1 || requestTimeLeft() < 2_000) break
+                Thread.sleep(700)
+            }
         }
     }
     throw last ?: IOException("Solana RPC error")
