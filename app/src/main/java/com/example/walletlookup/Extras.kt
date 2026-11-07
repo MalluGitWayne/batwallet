@@ -339,13 +339,7 @@ private fun solanaHistory(a: String): History {
         return (0 until arr.length()).map { arr.getJSONObject(it).getString("signature") }
     }
     // USDT / USDC arrive in separate token accounts, so their transactions are listed under those accounts.
-    val tokenAccounts = SOL_STABLES.keys.flatMap { mint ->
-        runCatching {
-            val v = solanaCall("getTokenAccountsByOwner", JSONArray().put(a).put(JSONObject().put("mint", mint))
-                .put(JSONObject().put("encoding", "jsonParsed"))).getJSONObject("result").getJSONArray("value")
-            (0 until v.length()).map { v.getJSONObject(it).getString("pubkey") }
-        }.getOrDefault(emptyList())
-    }
+    val tokenAccounts = runCatching { solanaTokenAccounts(a, SOL_STABLES.keys).values.map { it.first } }.getOrDefault(emptyList())
     val sigs = (sigsOf(a, minOf(MAX, 20), 20) + tokenAccounts.flatMap { runCatching { sigsOf(it, 10, 10) }.getOrDefault(emptyList()) }).distinct()
     // Four at a time (one by one took most of a minute). The pool's threads don't carry a background search's time
     // budget by themselves, so each task is given it; and the waits for them end with it too.

@@ -148,6 +148,12 @@ class LogicTest {
         assertEquals(0L, poolWait(-5_000L))
     }
 
+    @Test fun solanaTokenAccountAddress() {
+        // A real USDT holder and its token account, read from a transfer on the chain.
+        assertEquals("A2LJBG8uQbUEjgjRmuq2WU8FR9TExjfc1XH72KeCzCeJ",
+            associatedTokenAccount("GPUnAX82D88Z7eyLwMupCghjHBHHhucwrFk8BfYyvU26", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"))
+    }
+
     @Test fun versionComparison() {
         assertTrue(isNewerVersion("19.10", "19.9"))
         assertTrue(isNewerVersion("20.0", "19.2"))

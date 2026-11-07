@@ -587,17 +587,9 @@ internal fun solanaCall(method: String, params: JSONArray): JSONObject {
 
 private fun solana(a: String, p: Map<String, Double>): ChainResult {
     val lamports = solanaCall("getBalance", JSONArray().put(a)).getJSONObject("result").getLong("value")
-    // A refused token call fails the whole Solana lookup (the last good balances stay), never reads as 0 USDT.
-    fun token(mint: String): BigDecimal {
-        val accounts = solanaCall("getTokenAccountsByOwner", JSONArray().put(a).put(JSONObject().put("mint", mint))
-            .put(JSONObject().put("encoding", "jsonParsed"))).getJSONObject("result").getJSONArray("value")
-        var total = BigDecimal.ZERO
-        for (i in 0 until accounts.length()) {
-            total += BigDecimal(accounts.getJSONObject(i).getJSONObject("account").getJSONObject("data")
-                .getJSONObject("parsed").getJSONObject("info").getJSONObject("tokenAmount").getString("uiAmountString"))
-        }
-        return total
-    }
+    // A failed token read fails the whole Solana lookup (the last good balances stay), never reads as 0 USDT.
+    val tokens = solanaTokenAccounts(a, SOL_STABLES.keys)
+    fun token(mint: String): BigDecimal = tokens[mint]?.second ?: BigDecimal.ZERO
     val sigs = runCatching {
         solanaCall("getSignaturesForAddress", JSONArray().put(a).put(JSONObject().put("limit", 1))).getJSONArray("result")
     }.getOrNull()
