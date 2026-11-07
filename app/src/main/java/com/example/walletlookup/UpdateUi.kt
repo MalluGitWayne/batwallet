@@ -76,9 +76,12 @@ fun ReleaseNotes(text: String, modifier: Modifier = Modifier, skipVersionHeading
     }
 }
 
+/** A markdown link: [text](url). */
+private val MD_LINK = Regex("""\[([^]]+)]\([^)]+\)""")
+
 /** **bold**, `code` and [link](url) → plain styled text. */
 private fun markdownLine(s: String): AnnotatedString {
-    val text = s.replace(Regex("""\[([^]]+)]\([^)]+\)"""), "$1").replace("`", "")
+    val text = s.replace(MD_LINK, "$1").replace("`", "")
     return buildAnnotatedString {
         text.split("**").forEachIndexed { i, part ->
             if (i % 2 == 1) withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(part) } else append(part)
@@ -147,14 +150,14 @@ fun UpdateProgressDialog() {
 fun UpdateBanner(version: String, onClick: () -> Unit) {
     Row(
         Modifier.fillMaxWidth().padding(top = 4.dp).clip(RoundedCornerShape(14.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant).clickable(onClick = onClick)
+            .background(MaterialTheme.colorScheme.primaryContainer).clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp))
+        Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.width(10.dp))
         Text(tr("Version") + " $version " + tr("is available"), style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.weight(1f))
+            color = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.weight(1f))
         Text("Update", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.primary)
     }

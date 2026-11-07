@@ -8,7 +8,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -21,23 +20,27 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Icon
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,26 +74,40 @@ fun SafetyCard(
     platform: Platform?,
     /** Every network answered and the address has no balance and no activity anywhere: not activated yet. */
     unused: Boolean = false,
-    /** Some network didn't answer: a clean result would only be partial. */
-    incomplete: Boolean = false,
+    /** Networks that didn't answer: a clean result would only be partial. */
+    unanswered: List<String> = emptyList(),
+    /** Why the whole check couldn't run this time (the balances didn't load, no internet…). */
+    error: String? = null,
+    /** The check, or the balances it needs, is running again: Retry shows "Checking again…". */
+    retrying: Boolean = false,
+    onRetry: (() -> Unit)? = null,
 ) {
     var open by remember { mutableStateOf(false) }
-    val badCheck = safety?.checks?.firstOrNull { it.level == Level.BAD }
+    val incomplete = unanswered.isNotEmpty()
+    // Checks that couldn't run are listed with their reason under the verdict, not as ticks.
+    val failures = safety?.failed.orEmpty()
+    val shown = safety?.checks.orEmpty().filter { !it.failed }
+    val badCheck = shown.firstOrNull { it.level == Level.BAD }
     val danger = twin != null || badCheck != null
     val verdict = when {
-        twin != null -> "Lookalike of your saved \"${twin.name}\""
+        twin != null -> tr("Lookalike of your saved %s").replace("%s", "\"${twin.name}\"")
         badCheck != null -> badCheck.title
-        savedWallet?.contact == true -> "Your contact · ${savedWallet.name}"
+        savedWallet?.contact == true -> tr("Your contact") + " · ${savedWallet.name}"
         // An exchange's wallet (or your deposit address there) isn't yours to spend from.
         savedWallet != null && savedWallet.onExchange -> tr("In your wallets") + " · ${savedWallet.name}"
         savedWallet != null -> "Your own wallet"
         safety == null && loading -> "Checking…"
+        safety == null && error != null -> "Couldn't run the safety check"
         safety == null -> "Couldn't check right now"
-        safety.level == Level.WARN -> "New or unused address"
+        // A caution other than "never used" (e.g. "This is a smart contract") is the headline itself.
+        safety.level == Level.WARN -> shown.firstOrNull { it.level == Level.WARN && it.title != NO_ACTIVITY_TITLE }?.title
+            ?: "New or unused address"
+        failures.isNotEmpty() -> "Some checks didn't run"
         else -> "No red flags found"
     }
     val red = MaterialTheme.colorScheme.error
     val amber = Color(0xFFE0A100)
+    val grey = MaterialTheme.colorScheme.onSurfaceVariant
     // One colour and symbol per state: red = don't send, amber = never used, green = clean, grey = yours / checking.
     val notActivated = !danger && savedWallet == null && unused
     val partial = !danger && savedWallet == null && !notActivated && incomplete
@@ -99,19 +116,27 @@ fun SafetyCard(
         notActivated -> Triple(amber, "!", tr("Not activated yet"))
         // Your own wallet or contact: green once the checks found nothing wrong (grey while checking).
         savedWallet != null -> if (safety != null && safety.level != Level.BAD) Triple(InGreen, "✓", verdict)
-            else Triple(MaterialTheme.colorScheme.onSurfaceVariant, "✓", verdict)
+            else Triple(grey, "✓", verdict)
         // Grey, not green: a network didn't answer, so the all-clear would only cover part of the address.
-        partial -> Triple(MaterialTheme.colorScheme.onSurfaceVariant, "?", tr("Couldn't fully check"))
-        safety == null -> Triple(MaterialTheme.colorScheme.onSurfaceVariant, "…", verdict)
+        partial -> Triple(grey, "?", tr("Couldn't fully check"))
+        safety == null && error != null -> Triple(grey, "?", verdict)
+        safety == null -> Triple(grey, "…", verdict)
         safety.level == Level.WARN -> Triple(amber, "!", verdict)
+        // Grey too when part of the check couldn't run: "no red flags" would only cover what did.
+        failures.isNotEmpty() -> Triple(grey, "?", verdict)
         else -> Triple(InGreen, "✓", verdict)
     }
     val subtitle = when {
         twin != null -> "Different address made to look like yours. Don't send money to it."
         danger -> "Reported as a scam or compromised. Don't send money to this address."
         notActivated -> "This address has never received or sent anything. Double-check it before sending money."
-        partial -> "A network didn't answer. Try again in a moment."
-        else -> platform?.let { tr("Platform:") + " " + it.how }
+        else -> platform?.let { tr("Platform:") + " " + it.display }
+    }
+    // What couldn't be checked and why, each as (what, reason).
+    val problems = buildList {
+        if (error != null) add("Safety check didn't run" to error)
+        if (incomplete) add("Some networks didn't answer" to unanswered.joinToString(", "))
+        failures.forEach { add(it.title to it.detail) }
     }
     Card(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).clickable(enabled = safety != null) { open = !open },
@@ -122,7 +147,7 @@ fun SafetyCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(36.dp).background(tint.copy(alpha = 0.22f), CircleShape), contentAlignment = Alignment.Center) {
                     // The not-activated "!" shows straight away; it doesn't wait for the safety check.
-                    if (loading && safety == null && !notActivated && !partial) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = tint)
+                    if (loading && safety == null && !notActivated && !partial) BatSpinner(size = 16.dp, color = tint)
                     else Text(symbol, color = tint, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
                 }
                 Spacer(Modifier.width(12.dp))
@@ -131,15 +156,15 @@ fun SafetyCard(
                         color = if (danger) red else MaterialTheme.colorScheme.onSurface)
                     subtitle?.let {
                         Text(it, style = MaterialTheme.typography.bodySmall,
-                            color = if (danger) red else MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 2.dp))
+                            color = if (danger) red else grey, modifier = Modifier.padding(top = 2.dp))
                     }
                 }
-                if (safety != null) {
+                if (safety != null && shown.isNotEmpty()) {
                     Text(if (open) "Less" else "Details", style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(start = 8.dp))
+                        color = grey, modifier = Modifier.padding(start = 8.dp))
                 }
             }
-            safety?.let { s ->
+            if (shown.isNotEmpty()) {
                 if (!open) {
                     // The individual checks as small pills.
                     @OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
@@ -148,39 +173,88 @@ fun SafetyCard(
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        s.checks.forEach { c ->
+                        shown.forEach { c ->
+                            // Each flag in its level's colour: green clean, amber caution, red danger, grey information.
+                            val tone = levelColor(c.level)
                             Text(
                                 "${icon(c.level)}  ${tr(c.title)}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (c.level == Level.BAD) red else MaterialTheme.colorScheme.onSurface,
+                                style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold,
+                                color = tone,
                                 modifier = Modifier.clip(RoundedCornerShape(50))
-                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.7f))
+                                    .background(tone.copy(alpha = 0.16f))
                                     .padding(horizontal = 10.dp, vertical = 5.dp),
                             )
                         }
                     }
                 } else {
-                    s.checks.forEach { c ->
+                    shown.forEach { c ->
                         Column(Modifier.padding(top = 10.dp)) {
                             Text("${icon(c.level)}  ${tr(c.title)}", style = MaterialTheme.typography.labelLarge,
-                                color = if (c.level == Level.BAD) red else MaterialTheme.colorScheme.onSurface)
-                            Text(c.detail, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                fontWeight = FontWeight.SemiBold, color = levelColor(c.level))
+                            Text(c.detail, style = MaterialTheme.typography.labelSmall, color = grey)
                         }
                     }
                     Text("A clean result isn't a guarantee. Only send to people you trust.",
-                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.labelSmall, color = grey,
                         modifier = Modifier.padding(top = 10.dp))
+                }
+            }
+            if (problems.isNotEmpty()) SafetyProblems(problems, retrying, onRetry)
+        }
+    }
+}
+
+/** What the safety check couldn't do and why, with a Retry button (or "Checking again…" while it runs). */
+@Composable
+private fun SafetyProblems(problems: List<Pair<String, String>>, retrying: Boolean, onRetry: (() -> Unit)?) {
+    Column(
+        Modifier.padding(top = 12.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.55f))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        problems.forEach { (what, why) ->
+            Column {
+                Text("✕  " + tr(what), style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                Text(tr(why), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 20.dp))
+            }
+        }
+        if (onRetry != null) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
+                if (retrying) {
+                    BatSpinner(size = 16.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Checking again…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    OutlinedButton(onClick = onRetry, contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)) {
+                        Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Retry")
+                    }
                 }
             }
         }
     }
 }
 
+/** Title of the activity check's "never used" caution; that caution keeps the plain "New or unused address" headline. */
+private const val NO_ACTIVITY_TITLE = "No stablecoin transfers found"
+
 private fun icon(level: Level) = when (level) {
     Level.GOOD -> "✓"
     Level.INFO -> "i"
     Level.WARN -> "!"
     Level.BAD -> "✕"
+}
+
+/** One colour per check level: green clean, amber caution, red danger, grey for plain information. */
+@Composable
+private fun levelColor(level: Level): Color = when (level) {
+    Level.GOOD -> InGreen
+    Level.WARN -> Color(0xFFE0A100)
+    Level.BAD -> MaterialTheme.colorScheme.error
+    Level.INFO -> MaterialTheme.colorScheme.onSurfaceVariant
 }
 
 // ===================== History =====================
@@ -211,6 +285,41 @@ fun HistoryScreen(
     var reload by remember { mutableIntStateOf(if (preloaded == null) 1 else 0) }
     var limit by remember { mutableIntStateOf(25) }
     var selected by remember { mutableStateOf<Pair<String, Transfer>?>(null) }
+    val scope = rememberCoroutineScope()
+    // Networks being asked again after their history failed to load.
+    var retrying by remember { mutableStateOf(setOf<String>()) }
+
+    /**
+     * One network failed to load: ask just that one again (the others stay as they are). An address with a single
+     * network, or one pinned to a network, reloads the whole list instead.
+     */
+    fun retry(network: String) {
+        val nets = networks
+        if (nets == null || nets.size <= 1 || netOf(address) != null || network !in nets) { reload++; return }
+        if (network in retrying) return
+        retrying = retrying + network
+        // A pull-down or Load more started after this one supersedes it: its result is then dropped, not mixed in.
+        val startedAt = reload to limit
+        scope.launch {
+            try {
+                val fresh = try {
+                    history(address, setOf(network), limit)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                if (fresh.isNotEmpty() && (reload to limit) == startedAt) {
+                    val order = nets.toList()
+                    data = (data.orEmpty().filter { it.network != network } + fresh)
+                        .sortedBy { order.indexOf(it.network).let { i -> if (i < 0) Int.MAX_VALUE else i } }
+                    data?.let { HistoryCache.save(address, it) }
+                }
+            } finally {
+                retrying = retrying - network
+            }
+        }
+    }
 
     LaunchedEffect(reload) {
         if (reload == 0) { preloaded?.let { HistoryCache.save(address, it) }; return@LaunchedEffect }
@@ -224,7 +333,13 @@ fun HistoryScreen(
                 kotlinx.coroutines.coroutineScope {
                     order.forEach { n ->
                         launch {
-                            val h = runCatching { history(address, setOf(n), limit) }.getOrNull().orEmpty()
+                            val h = try {
+                                history(address, setOf(n), limit)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
                             h.forEach { fresh[it.network] = it }
                             // Fresh networks replace their old copy; the rest stay until theirs arrive.
                             data = (data.orEmpty().filter { it.network !in fresh.keys } + fresh.values)
@@ -244,6 +359,8 @@ fun HistoryScreen(
         }
     }
 
+    // Kept here, above the transaction page, so Back from a transaction returns to the same place in the list.
+    val listState = rememberLazyListState()
     selected?.let { (network, t) ->
         TransactionScreen(
             network, t, names,
@@ -274,16 +391,24 @@ fun HistoryScreen(
                 }
             }
             HorizontalDivider()
-            PullToRefreshBox(isRefreshing = loading, onRefresh = { reload++ }, modifier = Modifier.fillMaxSize()) {
+            BatPullToRefresh(isRefreshing = loading, onRefresh = { reload++ }, modifier = Modifier.fillMaxSize()) {
                 LazyColumn(
                     Modifier.fillMaxSize(),
+                    state = listState,
                     contentPadding = PaddingValues(16.dp),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     val d = data
                     if (d == null) {
                         item {
-                            if (loading) Text("Loading transfers…") else Text("Couldn't load history. Pull down to retry.")
+                            if (loading) Row(verticalAlignment = Alignment.CenterVertically) {
+                                BatSpinner(size = 18.dp)
+                                Spacer(Modifier.width(12.dp))
+                                Text("Loading transfers…")
+                            } else {
+                                Text("Couldn't load history.")
+                                TextButton(onClick = { reload++ }, contentPadding = PaddingValues(0.dp)) { Text("Retry") }
+                            }
                         }
                     } else {
                         val shown = d.filter { it.items.isNotEmpty() || it.error != null || it.note != null }
@@ -300,7 +425,19 @@ fun HistoryScreen(
                                     Text(h.network, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                                 }
                                 balances.firstOrNull { it.network == h.network && it.error == null }?.let { NetworkBalance(it) }
-                                h.error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                                h.error?.let { err ->
+                                    Text(err, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                                    // Ask this network again without pulling down the whole list.
+                                    val again = h.network in retrying
+                                    TextButton(onClick = { retry(h.network) }, enabled = !loading && !again,
+                                        contentPadding = PaddingValues(0.dp)) {
+                                        if (again) {
+                                            BatSpinner(size = 14.dp)
+                                            Spacer(Modifier.width(8.dp))
+                                        }
+                                        Text(if (again) "Loading…" else "Retry")
+                                    }
+                                }
                                 h.note?.let {
                                     Text(it, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
@@ -317,9 +454,14 @@ fun HistoryScreen(
                         }
                     }
                     // More transfers: fetch a bigger batch (each source has its own maximum).
-                    if (d != null && d.any { it.items.size >= 15 || it.canLoadMore } && limit < 200) {
+                    // Each source says whether a bigger page would add anything (a fixed-size one can't).
+                    if (d != null && d.any { it.canLoadMore } && limit < 200) {
                         item(key = "more") {
                             TextButton(onClick = { limit += 50; reload++ }, enabled = !loading, modifier = Modifier.fillMaxWidth()) {
+                                if (loading) {
+                                    BatSpinner(size = 14.dp)
+                                    Spacer(Modifier.width(8.dp))
+                                }
                                 Text(if (loading) "Loading…" else "Load more")
                             }
                         }
@@ -473,7 +615,7 @@ internal fun TransactionScreen(
         Card(Modifier.fillMaxWidth().clickable { onOpenAddress(addr) }) {
             Column(Modifier.padding(14.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(label + (tag?.let { " · $it" } ?: ""), style = MaterialTheme.typography.labelMedium,
+                    Text(tr(label) + (tag?.let { " · $it" } ?: ""), style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                     knownPlatform(addr)?.takeIf { names.labelFor(addr, network) == null }?.let {
                         Spacer(Modifier.width(6.dp))
@@ -529,7 +671,7 @@ internal fun TransactionScreen(
                         Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top) {
                             if (stale) Text("i", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.padding(horizontal = 6.dp))
-                            else CircularProgressIndicator(Modifier.padding(top = 2.dp).size(18.dp), strokeWidth = 2.dp)
+                            else BatSpinner(Modifier.padding(top = 2.dp), size = 18.dp)
                             Spacer(Modifier.width(12.dp))
                             Column {
                                 Text(if (stale) "Details not available" else "Finding the transaction details",

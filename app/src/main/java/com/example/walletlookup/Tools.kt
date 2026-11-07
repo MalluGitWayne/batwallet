@@ -6,7 +6,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -14,7 +13,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.TextButton
@@ -35,16 +33,14 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
-/**
- * Several addresses found (in a message, a photo or a shared text): pick one.
- * [fromPhoto] adds a reminder to compare with the original, since a camera can misread a character.
- */
+/** Several addresses found (in a message, a scanned code or a shared text): pick one. */
 @Composable
 fun AddressChooser(
     found: List<String>,
-    fromPhoto: Boolean,
     onPick: (String) -> Unit,
     onDismiss: () -> Unit,
     /** Set when the text could also be a transaction ID (0x + 64 characters is both an Aptos address and an EVM hash). */
@@ -56,11 +52,6 @@ fun AddressChooser(
         title = { Text(if (found.size == 1) "Address found" else "Addresses found") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
-                if (fromPhoto) {
-                    Text("Read from a photo: check it matches before you use it.",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-                    Spacer(Modifier.height(8.dp))
-                }
                 found.forEach { a ->
                     Column(
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onPick(a) }.padding(vertical = 10.dp, horizontal = 4.dp),
@@ -90,12 +81,33 @@ fun TxCheckDialog(initial: String = "", onFound: (TxInfo) -> Unit, onDismiss: ()
     var hash by remember { mutableStateOf(initial) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    // Some networks couldn't be asked (offline, busy service): the answer isn't "not found", so offer Retry.
+    var unreachable by remember { mutableStateOf(false) }
+    var job by remember { mutableStateOf<Job?>(null) }
     fun check() {
-        busy = true; error = null
-        scope.launch {
-            val r = runCatching { lookupTx(hash) }.getOrNull()
+        val h = hash
+        job?.cancel()
+        busy = true; error = null; unreachable = false
+        job = scope.launch {
+            val r = try {
+                lookupTx(h)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                TxSearch(null, listOf(tr("all networks")), failureReason(e))
+            }
+            if (hash != h) return@launch // the ID was edited meanwhile
             busy = false
-            if (r != null) onFound(r) else error = tr("Not found on the supported networks.")
+            val found = r.found
+            when {
+                found != null -> onFound(found)
+                r.unreachable.isNotEmpty() -> {
+                    unreachable = true
+                    error = tr("Couldn't check %s").replace("%s", r.unreachable.joinToString(", ")) + ". " +
+                        tr(r.reason ?: "Couldn't reach the service.")
+                }
+                else -> error = tr("Not found on the supported networks.")
+            }
         }
     }
     // Opened with an ID already filled in (shared, pasted or "Check as transaction ID"): search straight away.
@@ -106,22 +118,26 @@ fun TxCheckDialog(initial: String = "", onFound: (TxInfo) -> Unit, onDismiss: ()
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
-                    value = hash, onValueChange = { hash = it.trim(); error = null }, singleLine = true,
+                    value = hash, onValueChange = { hash = it.trim(); error = null; unreachable = false; job?.cancel(); busy = false },
+                    singleLine = true,
                     label = { Text("Transaction ID") },
                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                 )
-                TextButton(onClick = { clipboard.getText()?.text?.trim()?.let { hash = it; error = null } }, contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)) {
+                TextButton(onClick = { clipboard.getText()?.text?.trim()?.let { hash = it; error = null; unreachable = false; job?.cancel(); busy = false } },
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)) {
                     Text("Paste")
                 }
                 if (busy) Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    BatSpinner(size = 16.dp)
                     Spacer(Modifier.width(10.dp))
                     Text("Searching…", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
             }
         },
-        confirmButton = { TextButton(onClick = { check() }, enabled = looksLikeTxHash(hash) && !busy) { Text("Check") } },
+        confirmButton = {
+            TextButton(onClick = { check() }, enabled = looksLikeTxHash(hash) && !busy) { Text(if (unreachable) "Retry" else "Check") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
@@ -137,13 +153,19 @@ fun SendCheckDialog(onOpen: (String) -> Unit, onDismiss: () -> Unit) {
     var input by remember { mutableStateOf(clipboard.getText()?.text?.trim().orEmpty()) }
     var busy by remember { mutableStateOf(false) }
     var lines by remember { mutableStateOf<List<Pair<Level, String>>?>(null) }
+    // Part of the check couldn't run (each such line says why): offer Retry.
+    var incomplete by remember { mutableStateOf(false) }
+    var job by remember { mutableStateOf<Job?>(null) }
     fun check() {
         val a = cleanAddress(input)
         val type = detect(a)
+        job?.cancel()
+        busy = false
+        incomplete = false
         if (type == null) { lines = listOf(Level.BAD to tr("Not a supported address")); return }
         busy = true
         lines = null
-        scope.launch {
+        job = scope.launch {
             val out = mutableListOf<Pair<Level, String>>()
             val raw = rawAddress(a)
             lookalikeSource.firstOrNull { rawAddress(it.address).equals(raw, true) }?.let { w ->
@@ -153,17 +175,51 @@ fun SendCheckDialog(onOpen: (String) -> Unit, onDismiss: () -> Unit) {
                 out += Level.BAD to (tr("Lookalike of") + " " + walletLabel(twin) + " · " + tr("don't send"))
             }
             knownPlatform(a)?.let { out += Level.INFO to (tr("Exchange wallet") + ": " + it) }
-            val results = runCatching { lookup(a, type, withPrices = false) }.getOrDefault(emptyList())
+            var lookupError: String? = null
+            val results = try {
+                lookup(a, type, withPrices = false)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lookupError = failureReason(e)
+                emptyList()
+            }
             val ok = results.filter { it.error == null }
+            val unanswered = results.filter { it.error != null }.map { it.network }
             when {
-                results.isEmpty() || ok.isEmpty() -> out += Level.INFO to tr("Couldn't fully check")
-                ok.none { it.active } -> out += Level.WARN to tr("Not activated yet") + " · " + tr("never received or sent anything")
+                results.isEmpty() || ok.isEmpty() -> {
+                    out += Level.INFO to (tr("Couldn't fully check") + " · " + tr(lookupError ?: "No network answered."))
+                    incomplete = true
+                }
+                // "Never used" only when every network answered: one that didn't may be where it's used.
+                ok.none { it.active } -> if (unanswered.isEmpty()) {
+                    out += Level.WARN to tr("Not activated yet") + " · " + tr("never received or sent anything")
+                }
                 else -> out += Level.GOOD to tr("Used on") + " " + ok.filter { it.active }.joinToString(", ") { it.network }
             }
-            runCatching {
-                val used = ok.filter { it.active }.map { it.network }.toSet().ifEmpty { null }
-                safety(a, history(a, used, limit = 10)).checks
-            }.getOrDefault(emptyList()).forEach { c -> out += c.level to tr(c.title) }
+            if (ok.isNotEmpty() && unanswered.isNotEmpty()) {
+                out += Level.INFO to (tr("Some networks didn't answer") + ": " + unanswered.joinToString(", "))
+                incomplete = true
+            }
+            try {
+                // The networks it's used on, plus any that didn't answer (it may be used there). An address every
+                // network answered for with nothing is unused and needs no history at all. When the lookup itself
+                // failed there's nothing to go on: history works the networks out itself (null).
+                val used = ok.filter { it.active }.map { it.network }.toSet()
+                val wanted = if (results.isEmpty()) null else used + unanswered
+                safety(a, history(a, wanted, limit = 10), used).checks.forEach { c ->
+                    // A check that couldn't run says why.
+                    out += c.level to (tr(c.title) + if (c.failed) " · " + tr(c.detail) else "")
+                    if (c.failed) incomplete = true
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                out += Level.INFO to (tr("Safety check didn't run") + " · " + tr(failureReason(e)))
+                incomplete = true
+            }
+            // Only for the address still in the box: it may have been edited while this ran.
+            if (cleanAddress(input) != a) return@launch
             lines = out.distinctBy { it.second }
             busy = false
         }
@@ -175,14 +231,15 @@ fun SendCheckDialog(onOpen: (String) -> Unit, onDismiss: () -> Unit) {
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
-                    value = input, onValueChange = { input = it.trim(); lines = null }, singleLine = true,
+                    value = input, onValueChange = { input = it.trim(); lines = null; incomplete = false; job?.cancel(); busy = false },
+                    singleLine = true,
                     label = { Text("Address you'll send to") },
                     textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                 )
                 TextButton(onClick = { clipboard.getText()?.text?.trim()?.let { input = it; lines = null; check() } },
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)) { Text("Paste") }
                 if (busy) Row(verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                    BatSpinner(size = 16.dp)
                     Spacer(Modifier.width(10.dp))
                     Text("Checking…", color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
@@ -204,7 +261,10 @@ fun SendCheckDialog(onOpen: (String) -> Unit, onDismiss: () -> Unit) {
             }
         },
         confirmButton = {
-            if (lines != null && detect(cleanAddress(input)) != null) TextButton(onClick = { onOpen(cleanAddress(input)) }) { Text("Open") }
+            if (lines != null && detect(cleanAddress(input)) != null) Row {
+                if (incomplete) TextButton(onClick = { check() }, enabled = !busy) { Text("Retry") }
+                TextButton(onClick = { onOpen(cleanAddress(input)) }) { Text("Open") }
+            }
             else TextButton(onClick = { check() }, enabled = !busy && input.isNotBlank()) { Text("Check") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
@@ -235,9 +295,10 @@ fun CompareDialog(onDismiss: () -> Unit) {
                     }
                 }
                 if (x.isNotEmpty() && y.isNotEmpty()) {
-                    val same = x.equals(y, ignoreCase = x.startsWith("0x"))
+                    val caseless = ignoresCase(x) && ignoresCase(y)
+                    val same = x.equals(y, ignoreCase = caseless)
                     val diff = (0 until maxOf(x.length, y.length)).count { i ->
-                        !x.getOrNull(i).toString().equals(y.getOrNull(i).toString(), ignoreCase = x.startsWith("0x"))
+                        !x.getOrNull(i).toString().equals(y.getOrNull(i).toString(), ignoreCase = caseless)
                     }
                     Text(
                         if (same) "✓ " + tr("Same address") else "✗ " + tr("Different") + " · $diff " + tr(if (diff == 1) "character" else "characters"),
@@ -248,7 +309,7 @@ fun CompareDialog(onDismiss: () -> Unit) {
                             Text(
                                 buildAnnotatedString {
                                     s.forEachIndexed { i, ch ->
-                                        val bad = !ch.toString().equals(other.getOrNull(i).toString(), ignoreCase = s.startsWith("0x"))
+                                        val bad = !ch.toString().equals(other.getOrNull(i).toString(), ignoreCase = caseless)
                                         if (bad) withStyle(SpanStyle(color = OutRed, fontWeight = FontWeight.Bold)) { append(ch) } else append(ch)
                                     }
                                 },
@@ -262,3 +323,11 @@ fun CompareDialog(onDismiss: () -> Unit) {
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
     )
 }
+
+/**
+ * Address formats where upper and lower case are the same address: 0x (EVM), bech32 (bc1, ltc1, addr1…) and prefixed
+ * CashAddr. A bare q…/p… CashAddr isn't included: some case-sensitive Solana addresses look the same.
+ */
+private val CASELESS = Regex("^(0x|bc1|ltc1|addr1|cosmos1|bnb1|bitcoincash:)", RegexOption.IGNORE_CASE)
+
+internal fun ignoresCase(address: String): Boolean = CASELESS.containsMatchIn(address)

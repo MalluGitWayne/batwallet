@@ -2,11 +2,15 @@ package com.example.walletlookup
 
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.foundation.layout.size
 import androidx.compose.animation.animateContentSize
-import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.Icon
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -16,22 +20,15 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import java.math.BigDecimal
 
 /** Recognisable tokens beyond USDT/USDC and the native coin. Not counted in totals. */
 @Composable
@@ -67,34 +64,28 @@ private fun SectionHeader(title: String, action: String? = null, onAction: () ->
     Row(Modifier.fillMaxWidth().padding(bottom = 6.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
         Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
         if (action != null) {
-            Text(action, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            Text(action, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.clickable(onClick = onAction).padding(4.dp))
         }
     }
 }
 
-/** Payments the alerts noticed recently across your wallets. */
+/** Home's quiet backup nudge; tap to go to Settings → Backup. [days] since the last backup, 0 when there never was one. */
 @Composable
-fun ActivitySection(items: List<Pair<SavedAddress, Seen>>) {
-    Column {
-        SectionHeader("Recent activity")
-        Card(Modifier.fillMaxWidth().animateContentSize()) {
-            Column(Modifier.padding(vertical = 6.dp)) {
-                items.forEach { (w, s) ->
-                    val incoming = s.amount.signum() > 0
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 10.dp),
-                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                        Column(Modifier.weight(1f)) {
-                            Text((if (incoming) "Received · " else "Sent · ") + w.name, maxLines = 1)
-                            Text("${s.network} · ${shortDate(s.time / 1000)}", style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                        Text((if (incoming) "+" else "−") + hideable(transferValue(s.amount.abs(), s.symbol)),
-                            fontWeight = if (incoming) FontWeight.SemiBold else FontWeight.Normal)
-                    }
-                }
-            }
-        }
+fun BackupBanner(days: Int, onClick: () -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(top = 4.dp).clip(RoundedCornerShape(14.dp))
+            .background(MaterialTheme.colorScheme.primaryContainer).clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+    ) {
+        Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp), tint = MaterialTheme.colorScheme.primary)
+        Spacer(Modifier.width(10.dp))
+        Text(
+            if (days == 0) tr("No backup yet") else tr("No backup for %d days").replace("%d", days.toString()),
+            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.weight(1f),
+        )
+        Text("Export", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
     }
 }
 
@@ -151,11 +142,11 @@ fun DepositsCard(items: List<Triple<SavedAddress, String, Transfer>>) {
                 val ready = now - t.time >= (CREDIT_MINUTES[net] ?: 3) * 60_000L
                 Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                     if (ready) Text("✓", color = InGreen, fontWeight = FontWeight.Bold, modifier = Modifier.width(24.dp))
-                    else CircularProgressIndicator(Modifier.padding(end = 8.dp).size(16.dp), strokeWidth = 2.dp)
+                    else BatSpinner(Modifier.padding(end = 8.dp), size = 16.dp)
                     Column(Modifier.weight(1f)) {
                         Text(tr("Deposit to") + " $exchange · $net", fontWeight = FontWeight.Medium, maxLines = 1)
                         Text(if (ready) tr("Should be in your") + " $exchange " + tr("account now")
-                            else tr("Confirming") + " · " + tr("about") + " ${CREDIT_MINUTES[net] ?: 3} min",
+                            else tr("Confirming") + " · " + tr("about") + " ${CREDIT_MINUTES[net] ?: 3} " + tr("min"),
                             style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     Text("+" + hideable(transferValue(t.amount, t.symbol)), fontWeight = FontWeight.SemiBold, color = InGreen)
@@ -206,10 +197,16 @@ fun RecentTxSection(
                                     maxLines = 1,
                                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
                             }
-                            // Which of your wallets it was, then when.
-                            Text((walletName(w) ?: net) + " · " + (if (t.time > 0) shortDate(t.time / 1000) else tr("Pending")),
-                                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
-                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                            // Which of your wallets it was, then when. The time is never cut off: a long wallet name
+                            // gives way first ("Broke sato… · Yesterday 21:09").
+                            Row {
+                                Text(walletName(w) ?: net,
+                                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+                                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                                Text(" · " + (if (t.time > 0) shortDate(t.time / 1000) else tr("Pending")),
+                                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
+                                    softWrap = false)
+                            }
                         }
                         // In your chosen currency; the coin amount is on the transaction's page.
                         Text((if (t.incoming) "+" else "−") + hideable(transferValue(t.amount, t.symbol)),

@@ -1,10 +1,14 @@
 package com.example.walletlookup
 
 import android.util.Base64
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -55,10 +59,10 @@ enum class AddrType(val label: String) {
 data class ChainResult(
     val chain: String,
     val rows: List<Pair<String, String>> = emptyList(),
-    val explorerUrl: String? = null,
     val active: Boolean = true,
     val error: String? = null,
     val usdt: BigDecimal = BigDecimal.ZERO,
+    val usdc: BigDecimal = BigDecimal.ZERO,
     val nativeSym: String = "",
     val native: BigDecimal = BigDecimal.ZERO,
     /** Everything on this network in dollars (stablecoins + native coin), null if the price is unavailable. */
@@ -68,25 +72,14 @@ data class ChainResult(
     val network: String get() = chain.substringBefore(" ·")
 }
 
-/** Where coin prices come from; chosen in Settings. */
-enum class PriceSource(val label: String) {
-    AUTO("Auto (CoinMarketCap, then Binance, Bybit, CoinGecko)"),
-    COINMARKETCAP("CoinMarketCap"),
-    BINANCE("Binance"),
-    BYBIT("Bybit"),
-    COINGECKO("CoinGecko"),
-}
-
-@Volatile var priceSource: PriceSource = PriceSource.AUTO
-
 /**
- * Every balance an address holds, keyed "SYMBOL|Network" (e.g. "USDT|Aptos", "APT|Aptos").
+ * Every balance an address holds, keyed "SYMBOL|Network" (e.g. "USDT|Aptos", "USDC|Solana", "APT|Aptos").
  * Networks that failed to load are left out so they are never mistaken for a change.
  */
 suspend fun snapshot(address: String, networks: Set<String>? = null): Map<String, BigDecimal> {
     val type = detect(address) ?: return emptyMap()
     return lookup(address, type, withPrices = false, networks = networks).filter { it.error == null && it.nativeSym.isNotEmpty() }.flatMap { r ->
-        listOf("USDT|${r.network}" to r.usdt, "${r.nativeSym}|${r.network}" to r.native)
+        listOf("USDT|${r.network}" to r.usdt, "USDC|${r.network}" to r.usdc, "${r.nativeSym}|${r.network}" to r.native)
     }.toMap()
 }
 
@@ -112,13 +105,16 @@ private const val B58 = "[1-9A-HJ-NP-Za-km-z]"
  * ("ethereum:", "bitcoin:", "tron:", "ton://transfer/" …), amounts and chain ids, and
  * picks the recipient out of ERC-20 transfer links.
  */
+private val URI_RECIPIENT = Regex("[?&]address=([^&]+)")
+private val TON_RAW_ADDRESS = Regex("^-?\\d:[0-9a-fA-F]{64}$")
+private val URI_SCHEME = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
 fun cleanAddress(raw: String): String {
     var s = raw.trim().replace("\n", "").replace(" ", "")
     // EIP-681 token transfer: ethereum:0xTOKEN@56/transfer?address=0xRECIPIENT&uint256=…
-    Regex("[?&]address=([^&]+)").find(s)?.let { if (s.contains("/transfer")) return it.groupValues[1] }
+    URI_RECIPIENT.find(s)?.let { if (s.contains("/transfer")) return it.groupValues[1] }
     s = s.removePrefix("ton://transfer/")
-    val raw0x = Regex("^-?\\d:[0-9a-fA-F]{64}$")
-    if (!raw0x.matches(s.substringBefore('?')) && Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:").containsMatchIn(s)) {
+    if (!TON_RAW_ADDRESS.matches(s.substringBefore('?')) && URI_SCHEME.containsMatchIn(s)) {
         val scheme = s.substringBefore(':').lowercase()
         s = s.substringAfter(':').removePrefix("//")
         if (scheme in setOf("bitcoincash", "bchtest")) s = "bitcoincash:$s"
@@ -187,37 +183,48 @@ fun explorerUrl(a: String): String? {
     }
 }
 
+/** One address pattern: matched against the address as typed, or ([lower]) its lower-case form. */
+private class AddrRule(pattern: String, val type: AddrType, val lower: Boolean = false) {
+    val regex = Regex(pattern)
+}
+
+/**
+ * The patterns, in the order they are tried (the first match wins). Built once: [detect] runs for every list row,
+ * label and name lookup, and compiling two dozen patterns on each call made long wallet lists stutter.
+ */
+private val ADDR_RULES = listOf(
+    AddrRule("^0x[0-9a-fA-F]{40}$", AddrType.EVM),
+    AddrRule("^0x[0-9a-fA-F]{41,64}$", AddrType.APTOS),
+    AddrRule("^(bc1)[02-9ac-hj-np-z]{11,87}$", AddrType.BITCOIN, lower = true),
+    AddrRule("^[13]$B58{25,33}$", AddrType.BITCOIN),
+    AddrRule("^(bitcoincash:)?[qp][02-9ac-hj-np-z]{41}$", AddrType.BITCOIN_CASH, lower = true),
+    AddrRule("^ltc1[02-9ac-hj-np-z]{11,87}$", AddrType.LITECOIN, lower = true),
+    AddrRule("^[LM]$B58{26,33}$", AddrType.LITECOIN),
+    AddrRule("^D$B58{25,33}$", AddrType.DOGECOIN),
+    AddrRule("^T$B58{33}$", AddrType.TRON),
+    AddrRule("^r$B58{24,34}$", AddrType.XRP),
+    AddrRule("^addr1[02-9ac-hj-np-z]{50,120}$", AddrType.CARDANO, lower = true),
+    AddrRule("^cosmos1[02-9ac-hj-np-z]{38,58}$", AddrType.COSMOS, lower = true),
+    AddrRule("^bnb1[02-9ac-hj-np-z]{38}$", AddrType.BNB_BEACON, lower = true),
+    AddrRule("^G[A-Z2-7]{55}$", AddrType.STELLAR),
+    AddrRule("^[A-Z2-7]{58}$", AddrType.ALGORAND),
+    AddrRule("^(tz1|tz2|tz3|tz4|KT1)$B58{33}$", AddrType.TEZOS),
+    AddrRule("^1$B58{46,47}$", AddrType.POLKADOT),
+    // Workchain 0 (EQ/UQ, testnet kQ/0Q) and the masterchain (Ef/Uf, testnet kf/0f).
+    AddrRule("^(EQ|UQ|kQ|0Q|Ef|Uf|kf|0f)[A-Za-z0-9_+/-]{46}$", AddrType.TON),
+    AddrRule("^-?[0-9]:[0-9a-fA-F]{64}$", AddrType.TON),
+    AddrRule("^[0-9a-f]{64}$", AddrType.NEAR),
+    AddrRule("^([a-z0-9_-]+\\.)+(near|tg)$", AddrType.NEAR, lower = true),
+    AddrRule("^$B58{32,44}$", AddrType.SOLANA),
+    AddrRule("^[a-z1-5.]{1,12}$", AddrType.EOS),
+)
+
 fun detect(raw: String): AddrType? {
     val a = rawAddress(raw)
     if (a.isEmpty()) return null
     val l = a.lowercase()
-    return when {
-        l.startsWith("lnbc") || l.startsWith("lnurl") || l.startsWith("lightning:") -> AddrType.LIGHTNING
-        Regex("^0x[0-9a-fA-F]{40}$").matches(a) -> AddrType.EVM
-        Regex("^0x[0-9a-fA-F]{41,64}$").matches(a) -> AddrType.APTOS
-        Regex("^(bc1)[02-9ac-hj-np-z]{11,87}$").matches(l) -> AddrType.BITCOIN
-        Regex("^[13]$B58{25,33}$").matches(a) -> AddrType.BITCOIN
-        Regex("^(bitcoincash:)?[qp][02-9ac-hj-np-z]{41}$").matches(l) -> AddrType.BITCOIN_CASH
-        Regex("^ltc1[02-9ac-hj-np-z]{11,87}$").matches(l) -> AddrType.LITECOIN
-        Regex("^[LM]$B58{26,33}$").matches(a) -> AddrType.LITECOIN
-        Regex("^D$B58{25,33}$").matches(a) -> AddrType.DOGECOIN
-        Regex("^T$B58{33}$").matches(a) -> AddrType.TRON
-        Regex("^r$B58{24,34}$").matches(a) -> AddrType.XRP
-        Regex("^addr1[02-9ac-hj-np-z]{50,120}$").matches(l) -> AddrType.CARDANO
-        Regex("^cosmos1[02-9ac-hj-np-z]{38,58}$").matches(l) -> AddrType.COSMOS
-        Regex("^bnb1[02-9ac-hj-np-z]{38}$").matches(l) -> AddrType.BNB_BEACON
-        Regex("^G[A-Z2-7]{55}$").matches(a) -> AddrType.STELLAR
-        Regex("^[A-Z2-7]{58}$").matches(a) -> AddrType.ALGORAND
-        Regex("^(tz1|tz2|tz3|tz4|KT1)$B58{33}$").matches(a) -> AddrType.TEZOS
-        Regex("^1$B58{46,47}$").matches(a) -> AddrType.POLKADOT
-        Regex("^(EQ|UQ|kQ|0Q|Eu|Uu|ku|0f)[A-Za-z0-9_+/-]{46}$").matches(a) -> AddrType.TON
-        Regex("^-?[0-9]:[0-9a-fA-F]{64}$").matches(a) -> AddrType.TON
-        Regex("^[0-9a-f]{64}$").matches(a) -> AddrType.NEAR
-        Regex("^([a-z0-9_-]+\\.)+(near|tg)$").matches(l) -> AddrType.NEAR
-        Regex("^$B58{32,44}$").matches(a) -> AddrType.SOLANA
-        Regex("^[a-z1-5.]{1,12}$").matches(a) -> AddrType.EOS
-        else -> null
-    }
+    if (l.startsWith("lnbc") || l.startsWith("lnurl") || l.startsWith("lightning:")) return AddrType.LIGHTNING
+    return ADDR_RULES.firstOrNull { it.regex.matches(if (it.lower) l else a) }?.type
 }
 
 // ===================== Lookup =====================
@@ -226,33 +233,37 @@ suspend fun lookup(
     raw: String,
     type: AddrType,
     withPrices: Boolean = true,
-    /** EVM only: check just these networks (null = all). */
+    /** Check just these networks (null = all): the EVM networks, and Bitcoin Cash for a legacy Bitcoin address. */
     networks: Set<String>? = null,
 ): List<ChainResult> = coroutineScope {
     val a = rawAddress(raw)
     @Suppress("NAME_SHADOWING")
     val networks = netOf(raw)?.let { setOf(it) } ?: networks
+    // Prices load at the same time as the balances, not before them: each network is built without prices and
+    // priced at the end ([priced]), so a slow price service no longer holds up every balance request.
     val prices = async(Dispatchers.IO) { if (withPrices) prices() else emptyMap() }
     fun job(name: String, block: suspend (Map<String, Double>) -> ChainResult) =
-        async(Dispatchers.IO) { safe(name) { block(prices.await()) } }
+        async(Dispatchers.IO) { safe(name) { block(emptyMap()) } }
 
     val jobs = when (type) {
         AddrType.EVM -> EVM_CHAINS.filter { networks == null || it.name in networks }.map { c -> job(c.name) { evm(c, a, it) } } +
             (if (networks == null || "VeChain" in networks) listOf(job("VeChain") { vechain(a, it) }) else emptyList())
         AddrType.BITCOIN -> buildList {
-            add(job("Bitcoin") { esplora("Bitcoin", "https://mempool.space/api", "BTC", "bitcoin", "https://mempool.space/address/", a, it) })
-            // Legacy 1…/3… addresses also exist on Bitcoin Cash.
-            if (!a.lowercase().startsWith("bc1")) add(job("Bitcoin Cash") { bch(a, it) })
+            add(job("Bitcoin") { esplora("Bitcoin", "https://mempool.space/api", "BTC", "bitcoin", a, it) })
+            // Legacy 1…/3… addresses also exist on Bitcoin Cash (unless [networks] leaves it out).
+            if (!a.lowercase().startsWith("bc1") && (networks == null || "Bitcoin Cash" in networks)) {
+                add(job("Bitcoin Cash") { bch(a, it) })
+            }
         }
         AddrType.BITCOIN_CASH -> listOf(job("Bitcoin Cash") { bch(a, it) })
         AddrType.LITECOIN -> listOf(job("Litecoin") { p ->
             // litecoinspace.org is sometimes slow; BlockCypher is the backup.
             runCatching {
-                esplora("Litecoin", "https://litecoinspace.org/api", "LTC", "litecoin", "https://litecoinspace.org/address/", a, p)
-            }.getOrElse { blockcypher("Litecoin", "ltc", "LTC", "litecoin", "https://litecoinspace.org/address/", a, p) }
+                esplora("Litecoin", "https://litecoinspace.org/api", "LTC", "litecoin", a, p)
+            }.getOrElse { blockcypher("Litecoin", "ltc", "LTC", "litecoin", a, p) }
         })
         AddrType.DOGECOIN -> listOf(job("Dogecoin") {
-            blockcypher("Dogecoin", "doge", "DOGE", "dogecoin", "https://blockchair.com/dogecoin/address/", a, it)
+            blockcypher("Dogecoin", "doge", "DOGE", "dogecoin", a, it)
         })
         AddrType.TRON -> listOf(job("Tron") { tron(a, it) })
         AddrType.SOLANA -> listOf(job("Solana") { solana(a, it) })
@@ -276,12 +287,40 @@ suspend fun lookup(
                 "Lightning balances are private, so they can't be looked up from an invoice or address."), active = false)
         })
     }
-    // Networks with balance/activity first, uailures last.
-    jobs.awaitAll().sortedBy { if (it.error != null) 2 else if (it.active) 0 else 1 }
+    val done = jobs.awaitAll()
+    val p = prices.await()
+    // Networks with balance/activity first, failures last.
+    done.map { if (withPrices) priced(it, p) else it }.sortedBy { if (it.error != null) 2 else if (it.active) 0 else 1 }
 }
 
 private inline fun safe(chain: String, block: () -> ChainResult): ChainResult =
-    try { block() } catch (e: Exception) { ChainResult(chain, error = e.message ?: e.javaClass.simpleName) }
+    try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        ChainResult(chain, error = e.message ?: e.javaClass.simpleName)
+    }
+
+/**
+ * Adds the dollar values to a result [build] made without prices: the "Total value" row, the coin's own row and
+ * [ChainResult.usd]. The coin's price is found from its symbol; stablecoins count at $1.
+ */
+internal fun priced(r: ChainResult, p: Map<String, Double>): ChainResult {
+    if (r.error != null || r.nativeSym.isEmpty()) return r
+    val price = SYM_GECKO[r.nativeSym]?.let { p[it] }
+    val total = worth(r.usdt + r.usdc, r.native, price)
+    return r.copy(
+        rows = r.rows.map { (label, value) ->
+            when (label) {
+                "Total value" -> label to money(total)
+                r.nativeSym -> label to "${fmt(r.native)} · ${usd(r.native, price)}"
+                else -> label to value
+            }
+        },
+        usd = total,
+    )
+}
 
 /** Builds a result: "Total value", stablecoins, the native coin, then any extra rows. */
 private fun build(
@@ -290,7 +329,6 @@ private fun build(
     gecko: String,
     native: BigDecimal,
     p: Map<String, Double>,
-    explorer: String?,
     stables: List<Pair<String, BigDecimal>> = emptyList(),
     extra: List<Pair<String, String>> = emptyList(),
     activity: Boolean = false,
@@ -304,22 +342,23 @@ private fun build(
     rows += sym to "${fmt(native)} · ${usd(native, p[gecko])}"
     rows += extra
     return ChainResult(
-        chain, rows, explorer,
+        chain, rows,
         active = native.signum() > 0 || stableSum.signum() > 0 || activity,
         usdt = stables.filter { it.first.startsWith("USDT") }.fold(BigDecimal.ZERO) { s, x -> s + x.second },
+        usdc = stables.filter { it.first.startsWith("USDC") }.fold(BigDecimal.ZERO) { s, x -> s + x.second },
         nativeSym = sym, native = native, usd = total,
     )
 }
 
 // ---------- EVM networks (public JSON-RPC) ----------
 
-private data class Token(val symbol: String, val contract: String, val decimals: Int)
-private data class EvmChain(
+internal data class Token(val symbol: String, val contract: String, val decimals: Int)
+internal data class EvmChain(
     val name: String, val rpcs: List<String>, val sym: String, val gecko: String,
     val explorer: String, val tokens: List<Token>,
 )
 
-private val EVM_CHAINS = listOf(
+internal val EVM_CHAINS = listOf(
     EvmChain("Ethereum", listOf("https://ethereum-rpc.publicnode.com"), "ETH", "ethereum", "https://etherscan.io/address/", listOf(
         Token("USDT (ERC20)", "0xdAC17F958D2ee523a2206206994597C13D831ec7", 6),
         Token("USDC (ERC20)", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6),
@@ -358,9 +397,6 @@ private val EVM_CHAINS = listOf(
         "https://etc.blockscout.com/address/", emptyList()),
 )
 
-/** EVM network names in the order they are checked (used for history and explorers). */
-val EVM_NETWORKS: List<String> get() = EVM_CHAINS.map { it.name } + "VeChain"
-
 private fun evm(c: EvmChain, a: String, p: Map<String, Double>): ChainResult {
     fun call(id: Int, method: String, params: JSONArray) =
         JSONObject().put("jsonrpc", "2.0").put("id", id).put("method", method).put("params", params)
@@ -373,27 +409,34 @@ private fun evm(c: EvmChain, a: String, p: Map<String, Double>): ChainResult {
         batch.put(call(10 + i, "eth_call", JSONArray().put(JSONObject().put("to", t.contract).put("data", balanceOu)).put("latest")))
     }
 
+    // Each RPC in turn. A node that answers the batch but refuses a call inside it (rate limit, a bad batch) counts
+    // as failed too, so the next RPC is asked; only when every RPC fails does this network fail.
     var lastError: Exception? = null
-    val resp = c.rpcs.firstNotNullOfOrNull { url ->
-        try { JSONArray(http(url, batch.toString())) } catch (e: Exception) { lastError = e; null }
-    } ?: throw lastError ?: IOException("No response")
-    val byId = (0 until resp.length()).map { resp.getJSONObject(it) }.associateBy { it.optInt("id") }
-    fun hex(id: Int): BigInteger {
-        val r = byId[id] ?: throw IOException("No response from RPC")
-        r.optJSONObject("error")?.let { throw IOException(it.optString("message")) }
-        val h = r.optString("result").removePrefix("0x")
-        return if (h.isEmpty()) BigInteger.ZERO else BigInteger(h, 16)
+    for (url in c.rpcs) {
+        try {
+            val resp = JSONArray(http(url, batch.toString()))
+            val byId = (0 until resp.length()).map { resp.getJSONObject(it) }.associateBy { it.optInt("id") }
+            fun hex(id: Int): BigInteger {
+                val r = byId[id] ?: throw IOException("No response from RPC")
+                r.optJSONObject("error")?.let { throw IOException(it.optString("message")) }
+                val h = r.optString("result").removePrefix("0x")
+                return if (h.isEmpty()) BigInteger.ZERO else BigInteger(h, 16)
+            }
+            // A refused token call must fail this network, not read as "0 USDT": the alerts would then see every
+            // USDT the wallet holds as sent, and received again on the next check.
+            val stables = c.tokens.mapIndexed { i, t -> t.symbol to amount(hex(10 + i), t.decimals) }
+            val nonce = hex(2)
+            val native = amount(hex(1), 18)
+            return build(
+                c.name, c.sym, c.gecko, native, p, stables,
+                extra = listOf("Transactions sent" to nonce.toString()),
+                activity = nonce.signum() > 0,
+            )
+        } catch (e: Exception) {
+            lastError = e
+        }
     }
-
-    val stables = c.tokens.mapIndexed { i, t ->
-        t.symbol to amount(runCatching { hex(10 + i) }.getOrDefault(BigInteger.ZERO), t.decimals)
-    }
-    val nonce = hex(2)
-    return build(
-        c.name, c.sym, c.gecko, amount(hex(1), 18), p, c.explorer + a, stables,
-        extra = listOf("Transactions sent" to nonce.toString()),
-        activity = nonce.signum() > 0,
-    )
+    throw lastError ?: IOException("No response")
 }
 
 private fun vechain(a: String, p: Map<String, Double>): ChainResult {
@@ -401,7 +444,7 @@ private fun vechain(a: String, p: Map<String, Double>): ChainResult {
     val vet = amount(BigInteger(j.getString("balance").removePrefix("0x").ifEmpty { "0" }, 16), 18)
     val vtho = amount(BigInteger(j.getString("energy").removePrefix("0x").ifEmpty { "0" }, 16), 18)
     return build(
-        "VeChain", "VET", "vechain", vet, p, "https://vechainstats.com/account/$a",
+        "VeChain", "VET", "vechain", vet, p,
         extra = listOf("VTHO (energy)" to fmt(vtho)),
         activity = vtho.signum() > 0,
     )
@@ -409,7 +452,7 @@ private fun vechain(a: String, p: Map<String, Double>): ChainResult {
 
 // ---------- Bitcoin / Litecoin (Esplora), Bitcoin Cash (Haskoin), Dogecoin (BlockCypher) ----------
 
-private fun esplora(name: String, base: String, sym: String, gecko: String, explorer: String, a: String, p: Map<String, Double>): ChainResult {
+private fun esplora(name: String, base: String, sym: String, gecko: String, a: String, p: Map<String, Double>): ChainResult {
     val addr = if (a.startsWith("bc1", true) || a.startsWith("ltc1", true)) a.lowercase() else a
     val j = JSONObject(http("$base/address/$addr"))
     val c = j.getJSONObject("chain_stats")
@@ -424,7 +467,7 @@ private fun esplora(name: String, base: String, sym: String, gecko: String, expl
         "Transactions" to txCount.toString(),
     )
     if (pending != 0L) extra += "Pending" to "${fmt(amount(BigInteger.valueOf(pending), 8))} $sym"
-    return build(name, sym, gecko, amount(BigInteger.valueOf(received - sent), 8), p, explorer + addr,
+    return build(name, sym, gecko, amount(BigInteger.valueOf(received - sent), 8), p,
         extra = extra, activity = txCount > 0)
 }
 
@@ -433,7 +476,6 @@ private fun bch(a: String, p: Map<String, Double>): ChainResult {
     val bal = amount(BigInteger.valueOf(j.getLong("confirmed") + j.optLong("unconfirmed")), 8)
     val txs = j.optInt("txs")
     return build("Bitcoin Cash", "BCH", "bitcoin-cash", bal, p,
-        "https://blockchair.com/bitcoin-cash/address/" + j.optString("address", a).removePrefix("bitcoincash:"),
         extra = listOf(
             "Total received" to "${fmt(amount(BigInteger.valueOf(j.optLong("received")), 8))} BCH",
             "Transactions" to txs.toString(),
@@ -441,10 +483,10 @@ private fun bch(a: String, p: Map<String, Double>): ChainResult {
         activity = txs > 0)
 }
 
-private fun blockcypher(name: String, coin: String, sym: String, gecko: String, explorer: String, a: String, p: Map<String, Double>): ChainResult {
+private fun blockcypher(name: String, coin: String, sym: String, gecko: String, a: String, p: Map<String, Double>): ChainResult {
     val j = JSONObject(http("https://api.blockcypher.com/v1/$coin/main/addrs/$a/balance"))
     val txs = j.getInt("final_n_tx")
-    return build(name, sym, gecko, amount(BigInteger.valueOf(j.getLong("final_balance")), 8), p, explorer + a,
+    return build(name, sym, gecko, amount(BigInteger.valueOf(j.getLong("final_balance")), 8), p,
         extra = listOf(
             "Total received" to "${fmt(amount(BigInteger.valueOf(j.getLong("total_received")), 8))} $sym",
             "Transactions" to txs.toString(),
@@ -454,18 +496,20 @@ private fun blockcypher(name: String, coin: String, sym: String, gecko: String, 
 
 // ---------- Tron (TronGrid) ----------
 
-private const val USDT_TRC20 = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+/** Tether's USDT contracts, used by balances, history, the freeze check and transaction lookup alike. */
+internal const val USDT_TRC20 = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
 private fun tron(a: String, p: Map<String, Double>): ChainResult {
-    val explorer = "https://tronscan.org/#/address/$a"
     // TronGrid rate-limits quick bursts; publicnode's Tron node answers the same balances as a backup.
+    // An answer without the "data" list is a failure (the backup node is asked); only an empty list means "not activated".
     val data = try {
         JSONObject(http("https://api.trongrid.io/v1/accounts/$a")).optJSONArray("data")
+            ?: throw IOException("TronGrid sent no account data")
     } catch (e: Exception) {
-        return tronBackup(a, p, explorer)
+        return tronBackup(a, p)
     }
-    if (data == null || data.length() == 0) {
-        return build("Tron", "TRX", "tron", BigDecimal.ZERO, p, explorer, listOf("USDT (TRC20)" to BigDecimal.ZERO),
+    if (data.length() == 0) {
+        return build("Tron", "TRX", "tron", BigDecimal.ZERO, p, listOf("USDT (TRC20)" to BigDecimal.ZERO),
             extra = listOf("Status" to "Not activated (no on-chain activity yet)"))
     }
     val acc = data.getJSONObject(0)
@@ -479,25 +523,37 @@ private fun tron(a: String, p: Map<String, Double>): ChainResult {
     val extra = mutableListOf<Pair<String, String>>()
     if (acc.has("create_time")) extra += "Created" to date(acc.getLong("create_time") / 1000)
     acc.optLong("latest_opration_time").takeIf { it > 0 }?.let { extra += "Last activity" to date(it / 1000) }
-    return build("Tron", "TRX", "tron", amount(BigInteger.valueOf(acc.optLong("balance")), 6), p, explorer,
+    return build("Tron", "TRX", "tron", amount(BigInteger.valueOf(acc.optLong("balance")), 6), p,
         listOf("USDT (TRC20)" to usdt), extra, activity = true)
 }
 
-private fun tronBackup(a: String, p: Map<String, Double>, explorer: String): ChainResult {
+private fun tronBackup(a: String, p: Map<String, Double>): ChainResult {
     val node = "https://tron-rpc.publicnode.com/wallet"
     val acc = JSONObject(http("$node/getaccount", JSONObject().put("address", a).put("visible", true).toString()))
-    if (!acc.has("address")) {
-        return build("Tron", "TRX", "tron", BigDecimal.ZERO, p, explorer, listOf("USDT (TRC20)" to BigDecimal.ZERO),
+    // The node answers an unknown account with an empty {}; an "Error" or "code" in the answer is a failed request,
+    // never "not activated" (that would read as the wallet's whole balance gone).
+    if (acc.has("Error") || acc.has("code")) {
+        throw IOException("Tron node error: " + acc.optString("Error").ifEmpty { acc.optString("message", acc.optString("code")) })
+    }
+    if (acc.length() == 0) {
+        return build("Tron", "TRX", "tron", BigDecimal.ZERO, p, listOf("USDT (TRC20)" to BigDecimal.ZERO),
             extra = listOf("Status" to "Not activated (no on-chain activity yet)"))
     }
+    if (!acc.has("address")) throw IOException("Unexpected answer from the Tron node")
     // USDT: ask the token contract for balanceOf(address); the address goes in as 32 bytes of hex.
     val param = tronHex(a).padStart(64, '0')
     val r = JSONObject(http("$node/triggerconstantcontract", JSONObject().put("owner_address", a).put("contract_address", USDT_TRC20)
         .put("function_selector", "balanceOf(address)").put("parameter", param).put("visible", true).toString()))
-    val usdt = r.optJSONArray("constant_result")?.optString(0)?.ifEmpty { "0" }?.let { amount(BigInteger(it, 16), 6) } ?: BigDecimal.ZERO
+    // Only a successful call with a result is a balance: a refused or failed call fails the network, not "0 USDT".
+    if (r.has("Error")) throw IOException("Tron node error: " + r.optString("Error"))
+    if (r.optJSONObject("result")?.optBoolean("result") != true) {
+        throw IOException("Tron node error: " + (r.optJSONObject("result")?.optString("message") ?: "no result"))
+    }
+    val word = r.optJSONArray("constant_result")?.optString(0) ?: throw IOException("Tron node sent no USDT balance")
+    val usdt = amount(if (word.isEmpty()) BigInteger.ZERO else BigInteger(word, 16), 6)
     val extra = mutableListOf<Pair<String, String>>()
     if (acc.has("create_time")) extra += "Created" to date(acc.getLong("create_time") / 1000)
-    return build("Tron", "TRX", "tron", amount(BigInteger.valueOf(acc.optLong("balance")), 6), p, explorer,
+    return build("Tron", "TRX", "tron", amount(BigInteger.valueOf(acc.optLong("balance")), 6), p,
         listOf("USDT (TRC20)" to usdt), extra, activity = true)
 }
 
@@ -525,7 +581,8 @@ internal fun solanaCall(method: String, params: JSONArray): JSONObject {
 
 private fun solana(a: String, p: Map<String, Double>): ChainResult {
     val lamports = solanaCall("getBalance", JSONArray().put(a)).getJSONObject("result").getLong("value")
-    fun token(mint: String): BigDecimal = runCatching {
+    // A refused token call fails the whole Solana lookup (the last good balances stay), never reads as 0 USDT.
+    fun token(mint: String): BigDecimal {
         val accounts = solanaCall("getTokenAccountsByOwner", JSONArray().put(a).put(JSONObject().put("mint", mint))
             .put(JSONObject().put("encoding", "jsonParsed"))).getJSONObject("result").getJSONArray("value")
         var total = BigDecimal.ZERO
@@ -533,8 +590,8 @@ private fun solana(a: String, p: Map<String, Double>): ChainResult {
             total += BigDecimal(accounts.getJSONObject(i).getJSONObject("account").getJSONObject("data")
                 .getJSONObject("parsed").getJSONObject("info").getJSONObject("tokenAmount").getString("uiAmountString"))
         }
-        total
-    }.getOrDefault(BigDecimal.ZERO)
+        return total
+    }
     val sigs = runCatching {
         solanaCall("getSignaturesForAddress", JSONArray().put(a).put(JSONObject().put("limit", 1))).getJSONArray("result")
     }.getOrNull()
@@ -543,14 +600,13 @@ private fun solana(a: String, p: Map<String, Double>): ChainResult {
         extra += "Last activity" to date(it)
     }
     return build("Solana", "SOL", "solana", amount(BigInteger.valueOf(lamports), 9), p,
-        "https://solscan.io/account/$a",
         listOf("USDT (Solana)" to token("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
             "USDC (Solana)" to token("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")),
         extra, activity = sigs != null && sigs.length() > 0)
 }
 // ---------- TON (tonapi for the account, toncenter for USDT) ----------
 
-private const val USDT_TON = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
+internal const val USDT_TON = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
 
 private fun ton(a: String, p: Map<String, Double>): ChainResult {
     val enc = URLEncoder.encode(a, "UTF-8")
@@ -568,8 +624,7 @@ private fun ton(a: String, p: Map<String, Double>): ChainResult {
         else -> status.replaceFirstChar { it.uppercase() }
     })
     acc.optLong("last_activity").takeIf { it > 0 }?.let { extra += "Last activity" to date(it) }
-    return build("TON", "TON", "the-open-network", amount(BigInteger.valueOf(acc.optLong("balance")), 9), p,
-        "https://tonviewer.com/$a", listOf("USDT (TON)" to usdt), extra, activity = status == "active")
+    return build("TON", "TON", "the-open-network", amount(BigInteger.valueOf(acc.optLong("balance")), 9), p, listOf("USDT (TON)" to usdt), extra, activity = status == "active")
 }
 
 // ---------- XRP Ledger ----------
@@ -578,23 +633,23 @@ private fun xrp(a: String, p: Map<String, Double>): ChainResult {
     val body = JSONObject().put("method", "account_info")
         .put("params", JSONArray().put(JSONObject().put("account", a).put("ledger_index", "validated")))
     val res = JSONObject(http("https://xrplcluster.com/", body.toString())).getJSONObject("result")
-    val explorer = "https://livenet.xrpl.org/accounts/$a"
     if (res.optString("status") == "error") {
         if (res.optString("error") == "actNotFound") {
-            return build("XRP Ledger", "XRP", "ripple", BigDecimal.ZERO, p, explorer,
+            return build("XRP Ledger", "XRP", "ripple", BigDecimal.ZERO, p,
                 extra = listOf("Status" to "Not activated (no on-chain activity yet)"))
         }
         throw IOException(res.optString("error_message", res.optString("error")))
     }
     val d = res.getJSONObject("account_data")
-    return build("XRP Ledger", "XRP", "ripple", amount(BigInteger(d.getString("Balance")), 6), p, explorer,
-        extra = listOf("Transactions sent" to d.optLong("Sequence").toString()), activity = true)
+    return build("XRP Ledger", "XRP", "ripple", amount(BigInteger(d.getString("Balance")), 6), p,
+        // Not "Transactions sent": accounts made since 2020 start their Sequence at the ledger number (tens of millions).
+        extra = listOf("Account sequence" to d.optLong("Sequence").toString()), activity = true)
 }
 
 // ---------- Aptos (official fullnode REST API) ----------
 
-private const val APTOS = "https://fullnode.mainnet.aptoslabs.com/v1"
-private const val USDT_APTOS = "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b"
+internal const val APTOS_NODE = "https://fullnode.mainnet.aptoslabs.com/v1"
+internal const val USDT_APTOS = "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b"
 
 private fun aptos(raw: String, p: Map<String, Double>): ChainResult {
     val a = "0x" + raw.removePrefix("0x").lowercase().padStart(64, '0')
@@ -602,12 +657,12 @@ private fun aptos(raw: String, p: Map<String, Double>): ChainResult {
         val body = JSONObject().put("function", fn)
             .put("type_arguments", JSONArray().put(type))
             .put("arguments", JSONArray(args.toList()))
-        return BigInteger(JSONArray(http("$APTOS/view", body.toString())).getString(0))
+        return BigInteger(JSONArray(http("$APTOS_NODE/view", body.toString())).getString(0))
     }
     val usdt = amount(view("0x1::primary_fungible_store::balance", "0x1::fungible_asset::Metadata", a, USDT_APTOS), 6)
     val apt = amount(view("0x1::coin::balance", "0x1::aptos_coin::AptosCoin", a), 8)
-    val seq = runCatching { JSONObject(http("$APTOS/accounts/$a")).optString("sequence_number", "0") }.getOrDefault("0")
-    return build("Aptos", "APT", "aptos", apt, p, "https://explorer.aptoslabs.com/account/$a?network=mainnet",
+    val seq = runCatching { JSONObject(http("$APTOS_NODE/accounts/$a")).optString("sequence_number", "0") }.getOrDefault("0")
+    return build("Aptos", "APT", "aptos", apt, p,
         listOf("USDT (Aptos)" to usdt), listOf("Transactions sent" to seq), activity = seq != "0")
 }
 
@@ -620,17 +675,28 @@ private fun cardano(a: String, p: Map<String, Double>): ChainResult {
     val ada = amount(BigInteger(o?.optString("balance")?.ifEmpty { "0" } ?: "0"), 6)
     val extra = mutableListOf<Pair<String, String>>()
     o?.optString("stake_address")?.takeIf { it.isNotBlank() && it != "null" }?.let { extra += "Stake address" to it.take(14) + "…" }
-    return build("Cardano", "ADA", "cardano", ada, p, "https://cardanoscan.io/address/$a", extra = extra, activity = o != null)
+    return build("Cardano", "ADA", "cardano", ada, p, extra = extra, activity = o != null)
 }
 
 // ---------- Polkadot (Parity public Sidecar) ----------
 
+/**
+ * Since the 2025 migration most DOT balances live on Asset Hub, while some (older or staking accounts) are still on
+ * the relay chain: both are asked and added up. Either one failing fails Polkadot, so a partial total never shows.
+ */
 private fun polkadot(a: String, p: Map<String, Double>): ChainResult {
-    val j = JSONObject(http("https://polkadot-public-sidecar.parity-chains.parity.io/accounts/$a/balance-info"))
-    val free = BigInteger(j.optString("free", "0").ifEmpty { "0" })
-    val reserved = BigInteger(j.optString("reserved", "0").ifEmpty { "0" })
+    fun balance(sidecar: String): Pair<BigInteger, BigInteger> {
+        val j = JSONObject(http("$sidecar/accounts/$a/balance-info"))
+        if (!j.has("free")) throw IOException("Polkadot: no balance in the answer")
+        val free = BigInteger(j.optString("free", "0").ifEmpty { "0" })
+        val reserved = BigInteger(j.optString("reserved", "0").ifEmpty { "0" })
+        return free to reserved
+    }
+    val (relayFree, relayReserved) = balance("https://polkadot-public-sidecar.parity-chains.parity.io")
+    val (hubFree, hubReserved) = balance("https://polkadot-asset-hub-public-sidecar.parity-chains.parity.io")
+    val reserved = relayReserved + hubReserved
     val extra = if (reserved.signum() > 0) listOf("Reserved / staked" to "${fmt(amount(reserved, 10))} DOT") else emptyList()
-    return build("Polkadot", "DOT", "polkadot", amount(free + reserved, 10), p, "https://polkadot.subscan.io/account/$a", extra = extra)
+    return build("Polkadot", "DOT", "polkadot", amount(relayFree + hubFree + reserved, 10), p, extra = extra)
 }
 
 // ---------- Cosmos Hub (public LCD) ----------
@@ -642,19 +708,27 @@ private fun cosmos(a: String, p: Map<String, Double>): ChainResult {
         val b = arr.getJSONObject(i)
         if (b.getString("denom") == "uatom") uatom = BigInteger(b.getString("amount"))
     }
-    return build("Cosmos Hub", "ATOM", "cosmos", amount(uatom, 6), p, "https://www.mintscan.io/cosmos/address/$a",
+    return build("Cosmos Hub", "ATOM", "cosmos", amount(uatom, 6), p,
         activity = arr.length() > 0)
 }
 
 // ---------- Stellar (Horizon) ----------
 
+/** The real stablecoins on Stellar: asset code → issuer (Circle's USDC, Tether's USDT). */
+private val STELLAR_ISSUERS = mapOf(
+    "USDC" to "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    "USDT" to "GCQTGZQQ5G4PTM2GL7CDIFKUBIPEC52BROAQIAPW53XBRJVN6ZJVTG6V",
+)
+
+/** True for Circle's USDC or Tether's USDT on Stellar; false for any other asset, whatever its code. */
+internal fun isStellarStable(code: String, issuer: String): Boolean = STELLAR_ISSUERS[code] == issuer
+
 private fun stellar(a: String, p: Map<String, Double>): ChainResult {
-    val explorer = "https://stellar.expert/explorer/public/account/$a"
     val j = try {
         JSONObject(http("https://horizon.stellar.org/accounts/$a"))
     } catch (e: IOException) {
         if (e.message?.startsWith("HTTP 404") == true) {
-            return build("Stellar", "XLM", "stellar", BigDecimal.ZERO, p, explorer,
+            return build("Stellar", "XLM", "stellar", BigDecimal.ZERO, p,
                 extra = listOf("Status" to "Not activated (no on-chain activity yet)"))
         }
         throw e
@@ -665,9 +739,12 @@ private fun stellar(a: String, p: Map<String, Double>): ChainResult {
     for (i in 0 until balances.length()) {
         val b = balances.getJSONObject(i)
         if (b.getString("asset_type") == "native") xlm = BigDecimal(b.getString("balance"))
-        else if (b.optString("asset_code") in setOf("USDT", "USDC")) stables += "${b.getString("asset_code")} (Stellar)" to BigDecimal(b.getString("balance"))
+        // Anyone can issue an asset called USDT or USDC on Stellar: only the real issuers' count.
+        else if (isStellarStable(b.optString("asset_code"), b.optString("asset_issuer"))) {
+            stables += "${b.getString("asset_code")} (Stellar)" to BigDecimal(b.getString("balance"))
+        }
     }
-    return build("Stellar", "XLM", "stellar", xlm, p, explorer, stables, activity = true)
+    return build("Stellar", "XLM", "stellar", xlm, p, stables, activity = true)
 }
 
 // ---------- Algorand (AlgoNode) ----------
@@ -682,8 +759,7 @@ private fun algorand(a: String, p: Map<String, Double>): ChainResult {
         }
         return BigDecimal.ZERO
     }
-    return build("Algorand", "ALGO", "algorand", amount(BigInteger.valueOf(j.optLong("amount")), 6), p,
-        "https://allo.info/account/$a", listOf("USDT (Algorand)" to asset(312769), "USDC (Algorand)" to asset(31566704)))
+    return build("Algorand", "ALGO", "algorand", amount(BigInteger.valueOf(j.optLong("amount")), 6), p, listOf("USDT (Algorand)" to asset(312769), "USDC (Algorand)" to asset(31566704)))
 }
 
 // ---------- NEAR (FastNEAR public RPC) ----------
@@ -693,67 +769,73 @@ private fun near(a: String, p: Map<String, Double>): ChainResult {
     fun query(params: JSONObject) = JSONObject(http(rpc,
         JSONObject().put("jsonrpc", "2.0").put("id", 1).put("method", "query").put("params", params).toString()))
     val acc = query(JSONObject().put("request_type", "view_account").put("finality", "final").put("account_id", a))
-    val explorer = "https://nearblocks.io/address/$a"
     val err = acc.optJSONObject("error")
     if (err != null || acc.optJSONObject("result") == null) {
         if (acc.toString().contains("does not exist") || acc.toString().contains("UNKNOWN_ACCOUNT")) {
-            return build("NEAR", "NEAR", "near", BigDecimal.ZERO, p, explorer,
+            return build("NEAR", "NEAR", "near", BigDecimal.ZERO, p,
                 extra = listOf("Status" to "Account doesn't exist yet"))
         }
         throw IOException(err?.optString("message") ?: "NEAR RPC error")
     }
     val nearBal = amount(BigInteger(acc.getJSONObject("result").getString("amount")), 24)
-    val usdt = runCatching {
+    // The node not answering the USDT call fails the network (not "0 USDT", which the alerts would report as money
+    // sent). The contract itself answering with an error (no record of this account) is a real 0.
+    val usdt = run {
         val args = Base64.encodeToString(JSONObject().put("account_id", a).toString().toByteArray(), Base64.NO_WRAP)
         val r = query(JSONObject().put("request_type", "call_function").put("finality", "final")
             .put("account_id", "usdt.tether-token.near").put("method_name", "ft_balance_of").put("args_base64", args))
-        val bytes = r.getJSONObject("result").getJSONArray("result")
-        val text = String(ByteArray(bytes.length()) { bytes.getInt(it).toByte() }).trim('"')
-        amount(BigInteger(text), 6)
-    }.getOrDefault(BigDecimal.ZERO)
-    return build("NEAR", "NEAR", "near", nearBal, p, explorer, listOf("USDT (NEAR)" to usdt), activity = true)
+        val res = r.getJSONObject("result")
+        if (res.has("error")) BigDecimal.ZERO
+        else {
+            val bytes = res.getJSONArray("result")
+            val text = String(ByteArray(bytes.length()) { bytes.getInt(it).toByte() }).trim('"')
+            amount(BigInteger(text), 6)
+        }
+    }
+    return build("NEAR", "NEAR", "near", nearBal, p, listOf("USDT (NEAR)" to usdt), activity = true)
 }
 
 // ---------- Tezos (TzKT) ----------
 
 private fun tezos(a: String, p: Map<String, Double>): ChainResult {
     val j = JSONObject(http("https://api.tzkt.io/v1/accounts/$a"))
-    val usdt = runCatching {
+    // An empty list is a real 0; a failed request fails the network instead of reading as 0 USDT.
+    val usdt = run {
         val arr = JSONArray(http("https://api.tzkt.io/v1/tokens/balances?account=$a&token.contract=KT1XnTn74bUtxHfDtBmm2bGZAQfhPbvKWR8o"))
         if (arr.length() > 0) amount(BigInteger(arr.getJSONObject(0).getString("balance")), 6) else BigDecimal.ZERO
-    }.getOrDefault(BigDecimal.ZERO)
+    }
     val txs = j.optInt("numTransactions")
-    return build("Tezos", "XTZ", "tezos", amount(BigInteger.valueOf(j.optLong("balance")), 6), p, "https://tzkt.io/$a",
+    return build("Tezos", "XTZ", "tezos", amount(BigInteger.valueOf(j.optLong("balance")), 6), p,
         listOf("USDT (Tezos)" to usdt), listOf("Transactions" to txs.toString()), activity = txs > 0)
 }
 
 // ---------- EOS (Greymass public API) ----------
 
 private fun eos(a: String, p: Map<String, Double>): ChainResult {
-    val explorer = "https://bloks.io/account/$a"
-    val j = try {
-        JSONObject(http("https://eos.greymass.com/v1/chain/get_account", JSONObject().put("account_name", a).toString()))
-    } catch (e: IOException) {
-        if (e.message?.contains("unknown key") == true || e.message?.startsWith("HTTP 500") == true) {
-            return ChainResult("EOS", listOf("Status" to "No EOS account with this name"), explorer, active = false)
+    // Read with the whole error body: [http] keeps only its first 150 characters, which can cut off the
+    // "unknown key" text. Only that (no such account) means "no account"; any other error fails EOS.
+    val (code, text) = request("https://eos.greymass.com/v1/chain/get_account", JSONObject().put("account_name", a).toString())
+    if (code !in 200..299) {
+        if (code != 429 && isEosUnknownAccount(text)) {
+            return ChainResult("EOS", listOf("Status" to "No EOS account with this name"), active = false)
         }
-        throw e
+        throw httpError(code, text)
     }
+    val j = JSONObject(text)
     val bal = BigDecimal(j.optString("core_liquid_balance", "0 EOS").substringBefore(' ').ifEmpty { "0" })
     val extra = j.optString("created").takeIf { it.isNotBlank() }?.let {
         listOf("Created" to date(Instant.parse(it + "Z").epochSecond))
     } ?: emptyList()
-    return build("EOS", "EOS", "eos", bal, p, explorer, extra = extra, activity = true)
+    return build("EOS", "EOS", "eos", bal, p, extra = extra, activity = true)
 }
 
-// ===================== Explorer links & sharing =====================
+/** An EOS node's error saying no account has this name (as opposed to the node itself failing). */
+internal fun isEosUnknownAccount(errorBody: String): Boolean =
+    errorBody.contains("unknown key", ignoreCase = true) ||
+        errorBody.contains("account_query_exception", ignoreCase = true) ||
+        errorBody.contains("account not found", ignoreCase = true)
 
-/** Block-explorer pages for an address, for the networks where it was found (or all of its networks). */
-fun explorerLinks(address: String, results: List<ChainResult> = emptyList()): List<Pair<String, String>> {
-    val uromResults = results.filter { it.active && it.explorerUrl != null }.map { it.network to it.explorerUrl!! }
-    if (uromResults.isNotEmpty()) return uromResults
-    return results.filter { it.explorerUrl != null }.take(3).map { it.network to it.explorerUrl!! }
-}
+// ===================== Lookalikes =====================
 
 /**
  * Address-poisoning guard: a different address that starts and ends like one of your saved wallets.
@@ -786,37 +868,47 @@ private val PAIRS = mapOf(
 
 @Volatile private var priceCache: Pair<Long, Map<String, Double>>? = null
 
-private fun prices(): Map<String, Double> {
+/** When "last_prices" was last written to the history preferences (it's a big file: not on every refresh). */
+@Volatile private var pricesSavedAt = 0L
+private const val PRICE_SAVE_EVERY_MS = 15 * 60_000L
+
+/** A usable price: a number that is neither NaN nor infinite (a NaN would break the amounts on screen). */
+private fun Double?.usable(): Double? = this?.takeIf { it.isFinite() }
+
+private suspend fun prices(): Map<String, Double> {
     // Reuse prices for 30 s so several lookups in a row don't hit the exchanges again.
     priceCache?.let { (t, m) -> if (System.currentTimeMillis() - t < 30_000 && m.size >= PAIRS.size - 2) return m }
     val out = mutableMapOf<String, Double>()
     fun missing() = PAIRS.filterKeys { it !in out }
-    val src = priceSource
-    fun use(s: PriceSource) = (src == PriceSource.AUTO || src == s) && missing().isNotEmpty()
 
     // CoinMarketCap first, then the exchanges, then CoinGecko for anything still missing.
-    if (use(PriceSource.COINMARKETCAP)) runCatching {
-        cmcQuotes().forEach { (id, q) -> out[id] = q.first }
-    }
-    if (use(PriceSource.BINANCE)) runCatching {
+    cmcQuotes().forEach { (id, q) -> q.first.usable()?.let { out[id] = it } }
+    if (missing().isNotEmpty()) runCatching {
         val arr = JSONArray(http("https://api.binance.com/api/v3/ticker/price"))
         val bySymbol = (0 until arr.length()).associate { arr.getJSONObject(it).let { o -> o.getString("symbol") to o.getString("price") } }
-        missing().forEach { (id, pair) -> bySymbol[pair]?.toDoubleOrNull()?.let { out[id] = it } }
+        missing().forEach { (id, pair) -> bySymbol[pair]?.toDoubleOrNull().usable()?.let { out[id] = it } }
     }
-    if (use(PriceSource.BYBIT)) runCatching {
+    if (missing().isNotEmpty()) runCatching {
         val list = JSONObject(http("https://api.bybit.com/v5/market/tickers?category=spot"))
             .getJSONObject("result").getJSONArray("list")
         val bySymbol = (0 until list.length()).associate { list.getJSONObject(it).let { o -> o.getString("symbol") to o.optString("lastPrice") } }
-        missing().forEach { (id, pair) -> bySymbol[pair]?.toDoubleOrNull()?.let { out[id] = it } }
+        missing().forEach { (id, pair) -> bySymbol[pair]?.toDoubleOrNull().usable()?.let { out[id] = it } }
     }
-    if (use(PriceSource.COINGECKO)) runCatching {
+    if (missing().isNotEmpty()) runCatching {
         val j = JSONObject(http("https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&ids=" + missing().keys.joinToString(",")))
-        j.keys().forEach { out[it] = j.getJSONObject(it).optDouble("usd") }
+        // A coin CoinGecko doesn't price comes back without "usd" (optDouble's NaN): left out, never cached as NaN.
+        j.keys().forEach { k -> j.optJSONObject(k)?.optDouble("usd").usable()?.let { out[k] = it } }
     }
     if (out.isNotEmpty()) {
-        priceCache = System.currentTimeMillis() to out.toMap()
+        val now = System.currentTimeMillis()
+        priceCache = now to out.toMap()
         // Kept, so transfer values show right away next time the app opens (before prices are fetched again).
-        runCatching { historyPrefs?.edit()?.putString("last_prices", JSONObject(out.toMap()).toString())?.apply() }
+        // At most every 15 minutes: the history preferences are big and rewritten whole on each save.
+        val prefs = historyPrefs
+        if (prefs != null && now - pricesSavedAt >= PRICE_SAVE_EVERY_MS) {
+            pricesSavedAt = now
+            runCatching { prefs.edit().putString("last_prices", JSONObject(out.toMap()).toString()).apply() }
+        }
     }
     return out
 }
@@ -824,7 +916,7 @@ private fun prices(): Map<String, Double> {
 /** The latest known coin prices (USD): this session's, else the ones saved last time. */
 private fun knownPrices(): Map<String, Double> = priceCache?.second ?: runCatching {
     val j = JSONObject(historyPrefs?.getString("last_prices", null) ?: return emptyMap())
-    j.keys().asSequence().associateWith { j.getDouble(it) }
+    j.keys().asSequence().associateWith { j.getDouble(it) }.filterValues { it.isFinite() }
 }.getOrDefault(emptyMap())
 
 /**
@@ -853,8 +945,10 @@ fun transferUsd(amount: BigDecimal, symbol: String): BigDecimal? {
 fun transferValue(amount: BigDecimal, symbol: String): String {
     val usd = transferUsd(amount, symbol)
         ?: return (if (symbol.uppercase().startsWith("USD")) fmt2(amount) else fmt(amount)) + " " + symbol
-    // Tiny moves (fees, dust) read "< 0.01 USDT" rather than a misleading "0.00 USDT".
-    val cent = BigDecimal("0.01").divide(BigDecimal.valueOf(fiatRate), 8, java.math.RoundingMode.HALF_UP)
+    // Tiny moves (fees, dust) read "< 0.01 USDT" rather than a misleading "0.00 USDT". (A rate that never loaded
+    // is treated as 1, so this can't divide by zero.)
+    val rate = fiatRate.takeIf { it > 0 } ?: 1.0
+    val cent = BigDecimal("0.01").divide(BigDecimal.valueOf(rate), 8, java.math.RoundingMode.HALF_UP)
     return if (usd.signum() > 0 && usd < cent) "< " + money(cent) else money(usd)
 }
 
@@ -867,8 +961,27 @@ private val CMC_IDS = mapOf(
     "avalanche-2" to 5805, "polygon-ecosystem-token" to 28321, "sonic-3" to 32684, "eos" to 1765,
 )
 
+/** CoinMarketCap's last answer (price and 24h change per coin) and when it was fetched. */
+@Volatile private var quotesCache: Pair<Long, Map<String, Pair<Double, Double>>>? = null
+private val quotesLock = Mutex()
+
+/**
+ * Price and 24h change per coin from CoinMarketCap, shared by [prices] and [changes24h]: one request every 30 s at
+ * most, and callers arriving together wait for the same request. Empty when CoinMarketCap didn't answer (the other
+ * price sources are asked then); never throws, except to cancel.
+ */
+private suspend fun cmcQuotes(): Map<String, Pair<Double, Double>> = quotesLock.withLock {
+    quotesCache?.let { (t, m) -> if (System.currentTimeMillis() - t < 30_000) return@withLock m }
+    // A failed request is remembered for the 30 s as well (empty), so callers don't retry it one after another.
+    // Except one that failed inside a background search's budget: its short timeouts aren't the app's, so the
+    // screens would otherwise go without CoinMarketCap for 30 s because of them.
+    val fresh = runCatching { fetchCmcQuotes() }.getOrDefault(emptyMap())
+    if (fresh.isNotEmpty() || currentRequestBudget() == null) quotesCache = System.currentTimeMillis() to fresh
+    fresh
+}
+
 /** Price and 24h change per coin from CoinMarketCap's public data feed (no API key needed). */
-private fun cmcQuotes(): Map<String, Pair<Double, Double>> {
+private fun fetchCmcQuotes(): Map<String, Pair<Double, Double>> {
     val byCmc = CMC_IDS.entries.associate { (k, v) -> v to k }
     val j = JSONObject(http("https://api.coinmarketcap.com/data-api/v3/cryptocurrency/quote/latest?id=" + CMC_IDS.values.joinToString(",")))
     val arr = j.getJSONArray("data")
@@ -878,13 +991,10 @@ private fun cmcQuotes(): Map<String, Pair<Double, Double>> {
         val key = byCmc[o.getInt("id")] ?: continue
         val q = o.getJSONArray("quotes").getJSONObject(0)
         val price = q.optDouble("price")
-        if (!price.isNaN()) out[key] = price to q.optDouble("percentChange24h", 0.0)
+        if (price.isFinite()) out[key] = price to q.optDouble("percentChange24h", 0.0).let { if (it.isFinite()) it else 0.0 }
     }
     return out
 }
-
-/** Drop cached prices, e.g. after the price source changes. */
-fun clearPriceCache() { priceCache = null; changeCache = null }
 
 // ===================== Today's change =====================
 
@@ -900,29 +1010,31 @@ data class DayChange(val usd: BigDecimal, val percent: Double)
 
 @Volatile private var changeCache: Pair<Long, Map<String, Double>>? = null
 
-/** 24-hour price change in percent per coin (from the chosen source; Binance, then CoinGecko otherwise). */
-private fun changes24h(): Map<String, Double> {
+/** 24-hour price change in percent per coin (CoinMarketCap; Binance, then CoinGecko for anything missing). */
+private suspend fun changes24h(): Map<String, Double> {
     changeCache?.let { (t, m) -> if (System.currentTimeMillis() - t < 120_000) return m }
     val out = mutableMapOf<String, Double>()
-    if (priceSource == PriceSource.COINMARKETCAP || priceSource == PriceSource.AUTO) runCatching {
-        cmcQuotes().forEach { (id, q) -> out[id] = q.second }
-    }
+    cmcQuotes().forEach { (id, q) -> out[id] = q.second }
     if (out.size < PAIRS.size) runCatching {
         val symbols = JSONArray(PAIRS.values.toList()).toString()
         val arr = JSONArray(http("https://api.binance.com/api/v3/ticker/24hr?symbols=" + URLEncoder.encode(symbols, "UTF-8")))
         val bySymbol = (0 until arr.length()).associate { arr.getJSONObject(it).let { o -> o.getString("symbol") to o.optString("priceChangePercent") } }
-        PAIRS.forEach { (id, pair) -> bySymbol[pair]?.toDoubleOrNull()?.let { out[id] = it } }
+        PAIRS.forEach { (id, pair) -> bySymbol[pair]?.toDoubleOrNull().usable()?.let { out[id] = it } }
     }
     if (out.size < PAIRS.size) runCatching {
         val missing = PAIRS.keys.filter { it !in out }
         val j = JSONObject(http("https://api.coingecko.com/api/v3/simple/price?vs_currencies=usd&include_24hr_change=true&ids=" + missing.joinToString(",")))
-        j.keys().forEach { k -> j.getJSONObject(k).optDouble("usd_24h_change").takeIf { !it.isNaN() }?.let { out[k] = it } }
+        j.keys().forEach { k -> j.optJSONObject(k)?.optDouble("usd_24h_change").usable()?.let { out[k] = it } }
     }
     if (out.isNotEmpty()) changeCache = System.currentTimeMillis() to out.toMap()
     return out
 }
 
-/** How much the total of [results] moved over the last 24 hours. Stablecoins count as unchanged. */
+/**
+ * How much the total of [results] moved over the last 24 hours. Stablecoins count as unchanged. "Now" is the
+ * stablecoins plus each coin at today's price (the same price the change is worked out at), not the value saved with
+ * the results, which may be from an older price.
+ */
 suspend fun dayChange(results: List<ChainResult>): DayChange? = withContext(Dispatchers.IO) {
     val pct = changes24h()
     if (pct.isEmpty()) return@withContext null
@@ -931,11 +1043,21 @@ suspend fun dayChange(results: List<ChainResult>): DayChange? = withContext(Disp
     var delta = BigDecimal.ZERO
     for (r in results) {
         if (r.error != null) continue
-        now += r.usd ?: continue
-        val g = SYM_GECKO[r.nativeSym] ?: continue
-        val price = p[g] ?: continue
-        val c = pct[g] ?: continue
+        val stables = r.usdt + r.usdc
+        if (r.native.signum() == 0) {
+            now += stables
+            continue
+        }
+        val g = SYM_GECKO[r.nativeSym]
+        val price = g?.let { p[it] }
+        if (g == null || price == null) {
+            // No price today: its saved value (if any) counts, with no change.
+            now += r.usd ?: stables
+            continue
+        }
         val nativeNow = r.native.multiply(BigDecimal.valueOf(price))
+        now += stables + nativeNow
+        val c = pct[g] ?: continue
         delta += nativeNow.multiply(BigDecimal.valueOf(c / (100 + c)))
     }
     val before = now - delta
@@ -946,27 +1068,111 @@ suspend fun dayChange(results: List<ChainResult>): DayChange? = withContext(Disp
 // ===================== Helpers =====================
 
 internal fun http(url: String, body: String? = null, headers: Map<String, String> = emptyMap()): String {
+    val (code, text) = request(url, body, headers)
+    if (code !in 200..299) throw httpError(code, text)
+    return text
+}
+
+/** The error [http] throws for a failed status: "Rate limited…" for 429, else "HTTP <code> <start of the body>". */
+private fun httpError(code: Int, text: String): IOException =
+    IOException(if (code == 429) "Rate limited by the API, try again in a minute" else "HTTP $code ${text.take(150)}")
+
+/** Sends a request (POST when [body] is given) and returns the status code and the whole answer, error bodies too. */
+/**
+ * A time budget for a piece of background work: short request timeouts, trimmed to what's left of [deadline] (epoch
+ * millis), and no request starts once it's spent. Carried along with the work, also into the parallel requests it
+ * starts (see [withRequestBudget]). A coroutine time limit alone can't stop a request that is already waiting on a
+ * slow node: the request has to stop itself.
+ */
+internal class RequestBudget(val deadline: Long, val connectMs: Int = 4_000, val readMs: Int = 6_000)
+
+private val requestBudget = ThreadLocal<RequestBudget>()
+
+/** A request that wasn't made, or was cut off, because its budget's time was up. Reads as "took too long". */
+internal class OutOfTime : java.net.SocketTimeoutException("Out of time for this search")
+
+/** Milliseconds left in the budget the current work runs in; Long.MAX_VALUE outside one. */
+internal fun requestTimeLeft(now: Long = System.currentTimeMillis()): Long =
+    requestBudget.get()?.let { it.deadline - now } ?: Long.MAX_VALUE
+
+/** The budget the current work runs in, to hand on to threads that don't carry it themselves (a thread pool's). */
+internal fun currentRequestBudget(): RequestBudget? = requestBudget.get()
+
+/** Runs [block] on this thread within [budget] (null: none), e.g. a pool task started by budgeted work. */
+internal fun <T> inRequestBudget(budget: RequestBudget?, block: () -> T): T {
+    if (budget == null) return block()
+    val before = requestBudget.get()
+    requestBudget.set(budget)
+    try {
+        return block()
+    } finally {
+        if (before == null) requestBudget.remove() else requestBudget.set(before)
+    }
+}
+
+/**
+ * Connect and read timeouts for the next request: the normal 15 s / 20 s, or inside a [RequestBudget] its short ones,
+ * never past its deadline. Throws [OutOfTime] when the budget is already spent, so a chain of requests (a block
+ * search, a history with several sources) ends there instead of carrying on past its time.
+ */
+internal fun requestTimeouts(now: Long = System.currentTimeMillis()): Pair<Int, Int> {
+    val b = requestBudget.get() ?: return 15_000 to 20_000
+    val left = b.deadline - now
+    if (left <= 0) throw OutOfTime()
+    return minOf(b.connectMs.toLong(), left).toInt() to minOf(b.readMs.toLong(), left).toInt()
+}
+
+/**
+ * Runs [block] within a time budget of [budgetMs]: every request inside it (on any thread it moves to) uses short
+ * timeouts and none runs past the end. Null when the time ran out first.
+ */
+internal suspend fun <T> withRequestBudget(budgetMs: Long, block: suspend () -> T): T? {
+    val budget = RequestBudget(System.currentTimeMillis() + budgetMs)
+    // The extra second is only a backstop: each request already ends itself at the deadline (see [request]).
+    return kotlinx.coroutines.withTimeoutOrNull(budgetMs + 1_000) {
+        withContext(requestBudget.asContextElement(budget)) { block() }
+    }
+}
+
+/**
+ * Closes a budgeted request's connection when its deadline comes. The connect and read timeouts each fit in the time
+ * left, but together (and a read timeout applies to every read of a slow answer) they could still run past it;
+ * closing the connection makes the waiting read fail at once.
+ */
+private val requestDeadlines = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+    Thread(r, "request-deadlines").apply { isDaemon = true }
+}
+
+private fun request(url: String, body: String? = null, headers: Map<String, String> = emptyMap()): Pair<Int, String> {
+    val budget = requestBudget.get()
+    val (connectMs, readMs) = requestTimeouts()
     val c = URL(url).openConnection() as HttpURLConnection
-    c.connectTimeout = 15_000
-    c.readTimeout = 20_000
+    c.connectTimeout = connectMs
+    c.readTimeout = readMs
     c.setRequestProperty("Accept", "application/json")
     c.setRequestProperty("User-Agent", "Batwallet/1.0")
     headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
-    if (body != null) {
-        c.requestMethod = "POST"
-        c.doOutput = true
-        c.setRequestProperty("Content-Type", "application/json")
-        c.outputStream.use { it.write(body.toByteArray()) }
+    val cut = budget?.let { b ->
+        requestDeadlines.schedule({ runCatching { c.disconnect() } },
+            (b.deadline - System.currentTimeMillis()).coerceAtLeast(0), java.util.concurrent.TimeUnit.MILLISECONDS)
     }
     try {
+        if (body != null) {
+            c.requestMethod = "POST"
+            c.doOutput = true
+            c.setRequestProperty("Content-Type", "application/json")
+            c.outputStream.use { it.write(body.toByteArray()) }
+        }
         val code = c.responseCode
         val text = (if (code in 200..299) c.inputStream else c.errorStream)
             ?.bufferedReader()?.use { it.readText() }.orEmpty()
-        if (code !in 200..299) {
-            throw IOException(if (code == 429) "Rate limited by the API, try again in a minute" else "HTTP $code ${text.take(150)}")
-        }
-        return text
+        return code to text
+    } catch (e: IOException) {
+        // Cut off at the deadline (or failed just as it came): out of time, not a broken service.
+        if (budget != null && System.currentTimeMillis() >= budget.deadline) throw OutOfTime()
+        throw e
     } finally {
+        cut?.cancel(false)
         c.disconnect()
     }
 }
@@ -1062,19 +1268,23 @@ fun lookalikeOf(address: String): SavedAddress? = lookalike(address, lookalikeSo
 
 // ===================== Smart paste / text scan =====================
 
+private val NOT_ALNUM = Regex("[^a-z0-9]+")
+
+/** Words that name a network, in the order they are tried (the first match wins). */
+private val NETWORK_HINTS = listOf(
+    Regex(" (bep20|bep 20|bsc|bnb smart chain|binance smart chain|bnb chain) ") to "BSC",
+    Regex(" (erc20|erc 20|ethereum|eth mainnet) ") to "Ethereum",
+    Regex(" (polygon|matic|pol) ") to "Polygon",
+    Regex(" (arbitrum|arb) ") to "Arbitrum",
+    Regex(" (optimism|op mainnet) ") to "Optimism",
+    Regex(" (avalanche|avax|avax c) ") to "Avalanche",
+    Regex(" base (network|chain|mainnet) |\\bon base\\b") to "Base",
+)
+
 /** Network named in a message ("USDT BEP20", "send on Polygon"), used to pick the network for a 0x address. */
 fun networkHint(text: String): String? {
-    val t = " " + text.lowercase().replace(Regex("[^a-z0-9]+"), " ") + " "
-    return when {
-        Regex(" (bep20|bep 20|bsc|bnb smart chain|binance smart chain|bnb chain) ").containsMatchIn(t) -> "BSC"
-        Regex(" (erc20|erc 20|ethereum|eth mainnet) ").containsMatchIn(t) -> "Ethereum"
-        Regex(" (polygon|matic|pol) ").containsMatchIn(t) -> "Polygon"
-        Regex(" (arbitrum|arb) ").containsMatchIn(t) -> "Arbitrum"
-        Regex(" (optimism|op mainnet) ").containsMatchIn(t) -> "Optimism"
-        Regex(" (avalanche|avax|avax c) ").containsMatchIn(t) -> "Avalanche"
-        Regex(" base (network|chain|mainnet) |\\bon base\\b").containsMatchIn(t) -> "Base"
-        else -> null
-    }
+    val t = " " + text.lowercase().replace(NOT_ALNUM, " ") + " "
+    return NETWORK_HINTS.firstOrNull { it.first.containsMatchIn(t) }?.second
 }
 
 /** Common camera mix-ups inside hex addresses (O → 0, l / I → 1); base58 addresses are left alone. */
@@ -1087,28 +1297,43 @@ private fun fixHex(token: String): String =
  * A 0x address gets the network the text names, if any. Words that only look like addresses on networks with
  * free-form names (EOS accounts, NEAR names) are ignored here, so normal words never count.
  */
+private val LINE_BREAK = Regex("\\s*\\n\\s*")
+private val WORD_BREAK = Regex("[\\s,;()\\[\\]{}<>\"'`|]+")
+
 fun extractAddresses(text: String): List<String> {
     if (text.isBlank()) return emptyList()
     val hint = networkHint(text)
-    // Addresses are sometimes split over two lines (in photos and narrow chats): try the text joined up too.
-    val variants = listOf(text, text.replace(Regex("\\s*\\n\\s*"), ""))
+    // The addresses in a text, with their type. A word that contains an address of [skip] of another type is passed over.
+    fun scan(v: String, skip: List<Pair<String, AddrType>> = emptyList()): List<Pair<String, AddrType>> = v.split(WORD_BREAK).mapNotNull { raw ->
+        val token = fixHex(cleanAddress(raw.trim().trimEnd('.', ':', '!', '?')))
+        val type = detect(token) ?: return@mapNotNull null
+        if (type == AddrType.EOS || type == AddrType.LIGHTNING) return@mapNotNull null
+        if (type == AddrType.NEAR && !token.contains('.')) return@mapNotNull null // 64-hex is far more often a transaction ID
+        if (skip.any { (a, t) -> t != type && token.contains(a, ignoreCase = true) }) return@mapNotNull null
+        token to type
+    }
+    val firstPass = scan(text)
+    // Addresses are sometimes split over two lines (in photos and narrow chats): try the text joined up too. Joining
+    // also glues a whole address to the next line's first word ("T…HHL" + "thanks" reads like a Solana address), so
+    // a joined word that contains an address of another type found above is skipped. One of the same type is kept:
+    // the first half of a split bc1… address is itself a valid-looking bc1 address, and the joined one is the real
+    // address, so both are offered and the person picks.
+    val joined = scan(text.replace(LINE_BREAK, ""), skip = firstPass)
     val found = LinkedHashSet<String>()
-    for (v in variants) {
-        for (raw in v.split(Regex("[\\s,;()\\[\\]{}<>\"'`|]+"))) {
-            val token = fixHex(cleanAddress(raw.trim().trimEnd('.', ':', '!', '?')))
-            val type = detect(token) ?: continue
-            if (type == AddrType.EOS || type == AddrType.LIGHTNING) continue
-            if (type == AddrType.NEAR && !token.contains('.')) continue // 64-hex is far more often a transaction ID
-            if (type == AddrType.SOLANA && token.length < 32) continue
-            found += if (type == AddrType.EVM && hint != null) withNet(token, hint) else token
-        }
+    for ((token, type) in firstPass + joined) {
+        found += if (type == AddrType.EVM && hint != null) withNet(token, hint) else token
     }
     // Same address with and without a network: keep the one with the network.
     return found.filter { a -> netOf(a) != null || found.none { it != a && rawAddress(it).equals(a, true) } }.distinct()
 }
 
+/** Transaction ID shapes: 64 hex (Tron, Bitcoin, Litecoin, TON), 0x + 64 hex (EVM, Aptos), a Solana signature. */
+internal val HEX64 = Regex("^[0-9a-fA-F]{64}$")
+internal val HEX64_0X = Regex("^0x[0-9a-fA-F]{64}$")
+internal val SOL_SIGNATURE = Regex("^[1-9A-HJ-NP-Za-km-z]{86,90}$")
+
 /** Looks like a transaction ID rather than an address: 64 hex (Tron, Bitcoin…), 0x + 64 hex (EVM, Aptos) or a Solana signature. */
 fun looksLikeTxHash(s: String): Boolean {
     val t = s.trim()
-    return Regex("^(0x)?[0-9a-fA-F]{64}$").matches(t) || Regex("^[1-9A-HJ-NP-Za-km-z]{86,90}$").matches(t)
+    return HEX64.matches(t) || HEX64_0X.matches(t) || SOL_SIGNATURE.matches(t)
 }

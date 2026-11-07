@@ -23,6 +23,8 @@ data class SavedAddress(
     val note: String = "",
     /** Archived wallets are hidden everywhere (totals, alerts, lists) until you show or unarchive them. */
     val archived: Boolean = false,
+    /** Muted wallets are still refreshed and their payments logged, but they never notify. */
+    val muted: Boolean = false,
 )
 
 /** How the Wallets tab orders addresses. CUSTOM is your own order (Move up / Move down). */
@@ -50,13 +52,30 @@ fun parseBackup(json: String): List<SavedAddress> {
         if (address.isEmpty()) null
         else SavedAddress(o.optString("name", address.take(8)), address, o.optString("group", ""),
             o.optBoolean("contact", false), o.optBoolean("pinned", false), o.optString("platform", ""), o.optString("note", ""),
-            o.optBoolean("archived", false))
+            o.optBoolean("archived", false), o.optBoolean("muted", false))
     }.map(::foldered)
 }
 
 /** The Etherscan key saved in a backup file (empty when the backup has none). */
 fun parseBackupKey(json: String): String =
     runCatching { JSONObject(json.trim()).optString("etherscan_key", "").trim() }.getOrDefault("")
+
+/** The folder order saved in a backup file (empty when the backup has none, e.g. a bare list of wallets). */
+fun parseBackupGroupOrder(json: String): List<String> = runCatching {
+    val arr = JSONObject(json.trim()).optJSONArray("group_order") ?: return emptyList()
+    (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { g -> g.isNotBlank() } }
+}.getOrDefault(emptyList())
+
+/** Your folder order with a backup's merged in: yours stays as it is, folders only the backup knew follow in its order. */
+fun mergeGroupOrder(current: List<String>, imported: List<String>): List<String> =
+    (current + imported.filter { it !in current }).distinct()
+
+/**
+ * Which safety-check entries to delete ([times]: key to when it was checked): those in [keep] (your saved wallets)
+ * always stay; of the rest, only the [limit] most recent.
+ */
+fun safetyKeysToDrop(times: Map<String, Long>, keep: Set<String>, limit: Int = 50): Set<String> =
+    times.filterKeys { it !in keep }.entries.sortedByDescending { it.value }.drop(limit).map { it.key }.toSet()
 
 /** Folders and platforms are one thing now: a wallet with only a platform goes into that platform's folder. */
 private fun foldered(w: SavedAddress): SavedAddress =
@@ -65,8 +84,16 @@ private fun foldered(w: SavedAddress): SavedAddress =
 enum class ThemeMode(val label: String) { SYSTEM("Follow phone (black or white)"), DARK("Black (OLED)"), LIGHT("White") }
 
 /** Small on-device store for saved addresses and settings (nothing leaves the phone). */
+/**
+ * Held for every read-change-write of a wallet's payment log (`activity:`), which the background check, the search
+ * for missing details and the old-fee cleanup each do from their own threads: without it one could save over a
+ * payment the other just logged.
+ */
+internal val ACTIVITY_LOCK = Any()
+
 class Store(context: Context) {
     private val prefs = context.getSharedPreferences("wallet_lookup", Context.MODE_PRIVATE)
+    private val appContext: Context = context.applicationContext ?: context
 
     fun loadAddresses(): List<SavedAddress> {
         val arr = JSONArray(prefs.getString("addresses", "[]"))
@@ -74,19 +101,31 @@ class Store(context: Context) {
             val o = arr.getJSONObject(it)
             SavedAddress(o.getString("name"), o.getString("address"), o.optString("group", ""),
                 o.optBoolean("contact", false), o.optBoolean("pinned", false), o.optString("platform", ""), o.optString("note", ""),
-            o.optBoolean("archived", false))
+            o.optBoolean("archived", false), o.optBoolean("muted", false))
         }.map(::foldered)
     }
 
     fun saveAddresses(list: List<SavedAddress>) {
+        val before = runCatching { loadAddresses().map { it.address }.toSet() }.getOrDefault(emptySet())
         val arr = JSONArray()
         list.forEach {
             arr.put(JSONObject().put("name", it.name).put("address", it.address).put("group", it.group)
                 .put("contact", it.contact).put("pinned", it.pinned).put("platform", it.platform).put("note", it.note)
-                .put("archived", it.archived))
+                .put("archived", it.archived).put("muted", it.muted))
         }
-        prefs.edit().putString("addresses", arr.toString()).apply()
+        val edit = prefs.edit().putString("addresses", arr.toString()).putLong("addresses_changed", System.currentTimeMillis())
+        // A wallet that wasn't saved before (newly added, or from a backup) starts clean: starting balances or a
+        // payment log left from an earlier copy (e.g. deleted while a check was running) would show payments that
+        // never happened. Its first check records fresh starting balances.
+        list.map { it.address }.filter { it !in before }.forEach { edit.remove("snap:$it").remove("activity:$it") }
+        edit.apply()
     }
+
+    /** When a backup was last exported, and when the wallet list last changed (for the backup reminder). */
+    var lastBackup: Long
+        get() = prefs.getLong("last_backup", 0L)
+        set(v) = prefs.edit().putLong("last_backup", v).apply()
+    val addressesChangedAt: Long get() = prefs.getLong("addresses_changed", 0L)
 
     var theme: ThemeMode
         get() = runCatching { ThemeMode.valueOf(prefs.getString("theme2", ThemeMode.SYSTEM.name)!!) }.getOrDefault(ThemeMode.SYSTEM)
@@ -101,8 +140,15 @@ class Store(context: Context) {
         get() = prefs.getInt("lock_timeout", 0)
         set(v) = prefs.edit().putInt("lock_timeout", v).apply()
 
+    /** The fee entries older versions logged as payments were cleaned out of the payment logs (done once). */
+    var oldFeesCleaned: Boolean
+        get() = prefs.getBoolean("old_fees_cleaned", false)
+        set(v) = prefs.edit().putBoolean("old_fees_cleaned", v).apply()
+
     /** Payments the background alerts detected, newest first (kept per wallet, last 100). */
-    fun addActivity(address: String, entries: List<Seen>) = saveActivity(address, entries + loadActivity(address))
+    fun addActivity(address: String, entries: List<Seen>) = synchronized(ACTIVITY_LOCK) {
+        saveActivity(address, entries + loadActivity(address))
+    }
 
     /** Replaces the wallet's detected payments (e.g. after filling in details found later). */
     fun saveActivity(address: String, list: List<Seen>) {
@@ -124,18 +170,33 @@ class Store(context: Context) {
         }
     }.getOrDefault(emptyList())
 
-    /** The last safety check of an address and when it ran (re-checked every few hours, not on every open). */
+    /**
+     * The last safety check of an address and when it ran (re-checked every few hours, not on every open). Kept for
+     * your saved wallets, and for the 50 most recently checked other addresses.
+     */
     fun saveSafety(address: String, safety: Safety) {
         val arr = JSONArray()
-        safety.checks.forEach { arr.put(JSONObject().put("level", it.level.name).put("title", it.title).put("detail", it.detail)) }
-        prefs.edit().putString("safety:" + address.lowercase(), JSONObject().put("t", System.currentTimeMillis()).put("checks", arr).toString()).apply()
+        safety.checks.forEach {
+            arr.put(JSONObject().put("level", it.level.name).put("title", it.title).put("detail", it.detail).put("failed", it.failed))
+        }
+        val key = "safety:" + address.lowercase()
+        val now = System.currentTimeMillis()
+        val edit = prefs.edit().putString(key, JSONObject().put("t", now).put("checks", arr).toString())
+        runCatching {
+            val saved = loadAddresses().flatMap { listOf(it.address.lowercase(), rawAddress(it.address).lowercase()) }.toSet()
+            val times = prefs.all.filterKeys { it.startsWith("safety:") && it != key }
+                .mapValues { (_, v) -> runCatching { JSONObject(v as String).optLong("t") }.getOrDefault(0L) } + (key to now)
+            val keep = times.keys.filter { k -> k.removePrefix("safety:").let { it in saved || rawAddress(it) in saved } }.toSet()
+            safetyKeysToDrop(times, keep).forEach { edit.remove(it) }
+        }
+        edit.apply()
     }
 
     fun loadSafety(address: String): Pair<Long, Safety>? = runCatching {
         val o = JSONObject(prefs.getString("safety:" + address.lowercase(), null) ?: return null)
         val arr = o.getJSONArray("checks")
         o.getLong("t") to Safety((0 until arr.length()).map { arr.getJSONObject(it) }
-            .map { Check(Level.valueOf(it.getString("level")), it.getString("title"), it.getString("detail")) })
+            .map { Check(Level.valueOf(it.getString("level")), it.getString("title"), it.getString("detail"), it.optBoolean("failed")) })
     }.getOrNull()
 
     /** Daily summary notification at about 9 AM. */
@@ -184,22 +245,22 @@ class Store(context: Context) {
         }.getOrDefault(emptyList())
         set(v) = prefs.edit().putString("group_order", JSONArray(v).toString()).apply()
 
+    /**
+     * Restores the folder order from a backup file ([json], as given to [parseBackup]), merged with yours (see
+     * [mergeGroupOrder]). Returns the new order, for the screen to show.
+     */
+    fun importGroupOrder(json: String): List<String> {
+        val current = groupOrder
+        val merged = mergeGroupOrder(current, parseBackupGroupOrder(json))
+        if (merged != current) groupOrder = merged
+        return merged
+    }
+
     var currency: Fiat
         get() = runCatching { Fiat.valueOf(prefs.getString("currency", Fiat.USDT.name)!!) }.getOrDefault(Fiat.USDT)
         set(v) = prefs.edit().putString("currency", v.name).apply()
 
     /** Last known USD → currency rate, so values show instantly offline. */
-    /** USDT became the main currency in 16.3: switch once to it, after that your own choice stays. */
-    /** The Home chart was removed in 17.2: drop the totals it kept recording. */
-    fun dropChartData() {
-        if (prefs.contains("total_points")) prefs.edit().remove("total_points").remove("total_points_set").apply()
-    }
-
-    fun switchToUsdtOnce() {
-        if (prefs.getBoolean("usdt_default_done", false)) return
-        prefs.edit().putString("currency", Fiat.USDT.name).putFloat("currency_rate", 1f).putBoolean("usdt_default_done", true).apply()
-    }
-
     var currencyRate: Double
         get() = prefs.getFloat("currency_rate", 1f).toDouble()
         set(v) = prefs.edit().putFloat("currency_rate", v.toFloat()).apply()
@@ -254,8 +315,6 @@ class Store(context: Context) {
         }
     }.getOrDefault(emptyList())
 
-    fun loadRecent(): List<String> = loadRecentTimed().map { it.first }
-
     fun clearRecent() = prefs.edit().remove("recent").apply()
 
     /** Lock straight away when the phone screen turns off, whatever the auto-lock time. */
@@ -263,9 +322,22 @@ class Store(context: Context) {
         get() = prefs.getBoolean("lock_screen_off", true)
         set(v) = prefs.edit().putBoolean("lock_screen_off", v).apply()
 
-    /** Forget everything stored about a deleted wallet (balances, alert baseline, payment log). */
+    /** Forget everything stored about a deleted wallet (balances, alert baseline, payment log, saved history). */
     fun forget(address: String) {
-        prefs.edit().remove("cache:$address").remove("snap:$address").remove("activity:$address").apply()
+        prefs.edit().remove("cache:$address").remove("snap:$address").remove("activity:$address")
+            .remove("safety:" + address.lowercase()).apply()
+        runCatching {
+            // The "history" file: saved transaction lists ("histcache:<address>") and node logs ("loghist:<chain>:<address>").
+            val hist = appContext.getSharedPreferences("history", Context.MODE_PRIVATE)
+            val raw = rawAddress(address).lowercase()
+            val edit = hist.edit().remove("histcache:" + address.lowercase())
+            // The same address saved again (another network, or as a contact) keeps the history it shares.
+            if (loadAddresses().none { it.address != address && rawAddress(it.address).lowercase() == raw }) {
+                edit.remove("histcache:$raw")
+                hist.all.keys.filter { it.startsWith("loghist:") && it.endsWith(":$raw") }.forEach { edit.remove(it) }
+            }
+            edit.apply()
+        }
     }
 
     var hideBalances: Boolean
@@ -282,7 +354,7 @@ class Store(context: Context) {
         loadAddresses().forEach {
             arr.put(JSONObject().put("name", it.name).put("address", it.address).put("group", it.group)
                 .put("contact", it.contact).put("pinned", it.pinned).put("platform", it.platform).put("note", it.note)
-                .put("archived", it.archived))
+                .put("archived", it.archived).put("muted", it.muted))
         }
         return JSONObject().put("app", "Batwallet").put("version", 2).put("wallets", arr)
             .put("etherscan_key", etherscanKey).put("group_order", JSONArray(groupOrder)).toString(2)
@@ -296,10 +368,6 @@ class Store(context: Context) {
     var instantAlerts: Boolean
         get() = prefs.getBoolean("instant", false)
         set(v) = prefs.edit().putBoolean("instant", v).apply()
-
-    var priceSource: PriceSource
-        get() = runCatching { PriceSource.valueOf(prefs.getString("prices", PriceSource.AUTO.name)!!) }.getOrDefault(PriceSource.AUTO)
-        set(v) = prefs.edit().putString("prices", v.name).apply()
 
     /** Calls [listener] with the address whenever its saved balances change (e.g. after a payment alert). */
     fun onCacheChanged(listener: (String) -> Unit): SharedPreferences.OnSharedPreferenceChangeListener {
@@ -334,9 +402,9 @@ class Store(context: Context) {
             ChainResult(
                 chain = r.getString("chain"),
                 rows = rows,
-                explorerUrl = r.optString("explorer").ifEmpty { null },
                 active = r.optBoolean("active", true),
                 usdt = BigDecimal(r.optString("usdt", "0")),
+                usdc = BigDecimal(r.optString("usdc").ifEmpty { "0" }),
                 nativeSym = r.optString("nativeSym"),
                 native = BigDecimal(r.optString("native", "0")),
                 usd = r.optString("usd").ifEmpty { null }?.let { BigDecimal(it) },
@@ -352,8 +420,8 @@ class Store(context: Context) {
             r.rows.forEach { (l, v) -> rows.put(JSONArray().put(l).put(v)) }
             arr.put(
                 JSONObject()
-                    .put("chain", r.chain).put("rows", rows).put("explorer", r.explorerUrl.orEmpty())
-                    .put("active", r.active).put("usdt", r.usdt.toPlainString())
+                    .put("chain", r.chain).put("rows", rows)
+                    .put("active", r.active).put("usdt", r.usdt.toPlainString()).put("usdc", r.usdc.toPlainString())
                     .put("nativeSym", r.nativeSym).put("native", r.native.toPlainString())
                     .put("usd", r.usd?.toPlainString().orEmpty())
             )
@@ -362,11 +430,11 @@ class Store(context: Context) {
     }
 
     /** Last balances seen by the background checker, or null if this address was never checked. */
-    fun loadSnapshot(address: String): Map<String, BigDecimal>? {
-        val json = prefs.getString("snap:$address", null) ?: return null
-        val o = JSONObject(json)
-        return o.keys().asSequence().associateWith { BigDecimal(o.getString(it)) }
-    }
+    fun loadSnapshot(address: String): Map<String, BigDecimal>? = runCatching {
+        // A damaged entry counts as "never checked": the next check records fresh starting balances.
+        val o = JSONObject(prefs.getString("snap:$address", null) ?: return null)
+        o.keys().asSequence().associateWith { BigDecimal(o.getString(it)) }
+    }.getOrNull()
 
     fun saveSnapshot(address: String, snap: Map<String, BigDecimal>) {
         val o = JSONObject()

@@ -62,6 +62,86 @@ class LogicTest {
         assertEquals("46f3fb8c14006268d153b18000495c8ee858e94b", tronHex("TGSNahJvAdh86aR5pdcxiep1mBWSRK3HHL"))
     }
 
+    @Test fun detectsEachNetworkFromItsAddress() {
+        val samples = mapOf(
+            "0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE" to AddrType.EVM,
+            "0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE@BSC" to AddrType.EVM, // pinned to a network
+            "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b" to AddrType.APTOS,
+            "TGSNahJvAdh86aR5pdcxiep1mBWSRK3HHL" to AddrType.TRON,
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB" to AddrType.SOLANA,
+            "UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI" to AddrType.TON,
+            "0:83dfd552e63729b472fcbcc8c45ebcc6691702558b68ec7527e1ba403a0f31a8" to AddrType.TON,
+            "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq" to AddrType.BITCOIN,
+            "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa" to AddrType.BITCOIN,
+            "LdP8Qox1VAhCzLJNqrr74YovaWYyNBUWvL" to AddrType.LITECOIN,
+            "DH5yaieqoZN36fDVciNyRueRGvGLR3mr7L" to AddrType.DOGECOIN,
+            "rEb8TK3gBgk5auZkwc6sHnwrGVJH8DuaLh" to AddrType.XRP,
+            "GAHK7EEG2WWHVKDNT4CEQFZGKF2LGDSW2IVM4S5DP42RBW3K6BTODB4A" to AddrType.STELLAR,
+            "alice.near" to AddrType.NEAR,
+            "eosio.token" to AddrType.EOS,
+            "lnbc10u1p3xyz" to AddrType.LIGHTNING,
+        )
+        samples.forEach { (address, type) -> assertEquals(address, type, detect(address)) }
+        assertEquals(null, detect(""))
+        assertEquals(null, detect("hello world"))
+        assertEquals(null, detect("0x123"))
+    }
+
+    @Test fun sharedContractConstantsAgree() {
+        // Transaction lookup derives the hex form of the USDT contract from the shared T… address.
+        assertEquals("a614f803b6fd780986a42c78ec9c7f77e6ded13c", tronHex(USDT_TRC20))
+    }
+
+    @Test fun findsAddressesAndNetworkInPastedText() {
+        val found = extractAddresses("Send USDT (BEP20) to 0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE please,\nor TRC20: TGSNahJvAdh86aR5pdcxiep1mBWSRK3HHL.")
+        assertEquals(listOf("0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE@BSC", "TGSNahJvAdh86aR5pdcxiep1mBWSRK3HHL"), found)
+        assertEquals("Polygon", networkHint("send on polygon"))
+        assertEquals(null, networkHint("hello there"))
+        assertEquals("0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE",
+            cleanAddress("ethereum:0xdAC17F958D2ee523a2206206994597C13D831ec7@1/transfer?address=0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE&uint256=1"))
+        assertEquals("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", cleanAddress("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?amount=0.1"))
+        assertEquals("UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI", cleanAddress("ton://transfer/UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI"))
+        assertTrue(looksLikeTxHash("0x" + "ab".repeat(32)))
+        assertTrue(looksLikeTxHash("ab".repeat(32)))
+        assertFalse(looksLikeTxHash("0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE"))
+    }
+
+    @Test fun failedRequestsGetAPlainReason() {
+        assertEquals("No internet connection.", failureReason(java.net.UnknownHostException("api.gopluslabs.io")))
+        assertEquals("No internet connection.", failureReason(java.net.ConnectException("refused")))
+        assertEquals("The service took too long to answer.", failureReason(java.net.SocketTimeoutException("Read timed out")))
+        assertEquals("Too many requests. Wait a minute, then retry.",
+            failureReason(java.io.IOException("Rate limited by the API, try again in a minute")))
+        assertEquals("Too many requests. Wait a minute, then retry.", failureReason(java.io.IOException("HTTP 429 slow down")))
+        assertEquals("The service is down right now.", failureReason(java.io.IOException("HTTP 503 <html>Service Unavailable")))
+        assertEquals("The service refused the request.", failureReason(java.io.IOException("HTTP 403 {\"message\":\"forbidden\"}")))
+        assertEquals("Couldn't reach the service.", failureReason(IllegalStateException("anything else")))
+    }
+
+    @Test fun activityCheckSaysWhyItFailed() {
+        // Every history source failed: a failed check carrying the history's reason, without its "pull down" hint.
+        val down = activityCheck(listOf(History("Tron", error = "The service took too long. Pull down to retry.")))!!
+        assertTrue(down.failed)
+        assertEquals(Level.INFO, down.level)
+        assertEquals("The service took too long.", down.detail)
+        // Loaded with nothing in it: a real (not failed) warning.
+        val empty = activityCheck(listOf(History("Tron"), History("BSC", error = "No internet connection.")))!!
+        assertFalse(empty.failed)
+        assertEquals(Level.WARN, empty.level)
+        // No history source at all: no activity check.
+        assertEquals(null, activityCheck(listOf(History("VeChain", supported = false))))
+    }
+
+    @Test fun failedChecksAreListedAndNeverRaiseTheLevelToAWarning() {
+        val s = Safety(listOf(
+            Check(Level.GOOD, "Not on scam lists", "ok"),
+            Check(Level.INFO, "Tether freeze check failed", "No internet connection.", failed = true),
+        ))
+        assertEquals(Level.INFO, s.level)
+        assertEquals(listOf("Tether freeze check failed"), s.failed.map { it.title })
+        assertTrue(Safety(listOf(Check(Level.GOOD, "Active wallet", "ok"))).failed.isEmpty())
+    }
+
     @Test fun versionComparison() {
         assertTrue(isNewerVersion("19.10", "19.9"))
         assertTrue(isNewerVersion("20.0", "19.2"))
