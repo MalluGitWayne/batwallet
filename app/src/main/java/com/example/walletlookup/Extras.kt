@@ -8,6 +8,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.math.BigDecimal
 import java.math.BigInteger
 import java.net.URLEncoder
@@ -348,27 +349,39 @@ private fun solanaHistory(a: String): History {
     val sigs = (sigsOf(a, minOf(MAX, 20), 20) + tokenAccounts.flatMap { runCatching { sigsOf(it, 10, 10) }.getOrDefault(emptyList()) }).distinct()
     // Four at a time (one by one took most of a minute). The pool's threads don't carry a background search's time
     // budget by themselves, so each task is given it; and the waits for them end with it too.
+    // Two at a time: four set off the free RPC's rate limit, and every refused read used to vanish silently.
     val budget = currentRequestBudget()
-    val pool = java.util.concurrent.Executors.newFixedThreadPool(4)
+    val pool = java.util.concurrent.Executors.newFixedThreadPool(2)
+    var unread = 0
     val items = try {
         sigs.map { sig -> pool.submit<Transfer?> { inRequestBudget(budget) { solanaTransfer(a, sig) } } }
             .mapNotNull { f ->
-                val wait = minOf(20_000L, (requestTimeLeft() + 1_000).coerceAtLeast(0))
-                runCatching { f.get(wait, java.util.concurrent.TimeUnit.MILLISECONDS) }.getOrNull()
+                val wait = poolWait(requestTimeLeft())
+                runCatching { f.get(wait, java.util.concurrent.TimeUnit.MILLISECONDS) }
+                    .onFailure { unread++ }.getOrNull()
             }
     } finally { pool.shutdownNow() }
+    // Transactions were found but none could be read (rate-limited or timed out): say so, with Retry, instead of
+    // showing "No transfers" for a wallet that has them.
+    if (items.isEmpty() && unread > 0) throw IOException("Solana: couldn't read its transactions right now")
     return historyOf("Solana", bounds + Part(items))
 }
+
+/**
+ * How long to wait for one pool task: up to 20 s, and no longer than the budget's time left plus a second. Outside a
+ * budget the time left is Long.MAX_VALUE, so it must not be added to (that overflowed to 0 ms and dropped every read).
+ */
+internal fun poolWait(left: Long): Long = if (left >= 19_000L) 20_000L else (left + 1_000L).coerceAtLeast(0L)
 
 /**
  * One transaction for [a]: a USDT/USDC transfer if its token balance moved (the other side is the owner whose token
  * balance moved the opposite way), otherwise its SOL change (the other side is whoever's SOL moved the opposite way).
  */
 private fun solanaTransfer(a: String, sig: String): Transfer? {
-    val r = runCatching {
-        solanaCall("getTransaction", JSONArray().put(sig)
-            .put(JSONObject().put("encoding", "json").put("maxSupportedTransactionVersion", 0))).optJSONObject("result")
-    }.getOrNull() ?: return null
+    // A failed read throws (counted as unread by the caller); a missing result is simply not a transfer.
+    val r = solanaCall("getTransaction", JSONArray().put(sig)
+        .put(JSONObject().put("encoding", "json").put("maxSupportedTransactionVersion", 0))).optJSONObject("result")
+        ?: return null
     val meta = r.optJSONObject("meta") ?: return null
     if (meta.opt("err") != null && meta.opt("err") != JSONObject.NULL) return null
     val time = r.optLong("blockTime") * 1000

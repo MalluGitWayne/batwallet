@@ -11,8 +11,8 @@ android {
         applicationId = "com.malluwayne.batwallet"
         minSdk = 28
         targetSdk = 36
-        versionCode = 68
-        versionName = "20.9"
+        versionCode = 69
+        versionName = "21.0"
     }
 
     // Release key: kept outside the project (path and password in ~/.gradle/gradle.properties, never in git).

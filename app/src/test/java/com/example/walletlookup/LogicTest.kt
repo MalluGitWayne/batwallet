@@ -142,6 +142,12 @@ class LogicTest {
         assertTrue(Safety(listOf(Check(Level.GOOD, "Active wallet", "ok"))).failed.isEmpty())
     }
 
+    @Test fun poolWaitNeverOverflows() {
+        assertEquals(20_000L, poolWait(Long.MAX_VALUE)) // no budget: the full 20 s, not 0
+        assertEquals(6_000L, poolWait(5_000L))
+        assertEquals(0L, poolWait(-5_000L))
+    }
+
     @Test fun versionComparison() {
         assertTrue(isNewerVersion("19.10", "19.9"))
         assertTrue(isNewerVersion("20.0", "19.2"))
