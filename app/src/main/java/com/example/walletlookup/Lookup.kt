@@ -566,13 +566,22 @@ private fun tronBackup(a: String, p: Map<String, Double>): ChainResult {
 internal fun solanaCall(method: String, params: JSONArray): JSONObject {
     val body = JSONObject().put("jsonrpc", "2.0").put("id", 1).put("method", method).put("params", params).toString()
     var last: Exception? = null
+    var partial: JSONObject? = null
     // publicnode answers in well under a second; Solana's own public node is slow and often refuses, so it's the backup.
-    for (url in listOf("https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com")) {
+    val nodes = listOf("https://solana-rpc.publicnode.com", "https://api.mainnet-beta.solana.com")
+    for ((n, url) in nodes.withIndex()) {
         // A "Too many requests" refusal is asked once more after a short pause before moving on to the backup.
         for (attempt in 0..1) {
             try {
                 val r = JSONObject(http(url, body))
                 r.optJSONObject("error")?.let { throw IOException(it.optString("message")) }
+                // publicnode only keeps about a day of transactions: it answers "none" for older ones and lists only
+                // the last day's signatures. Then the backup, which keeps them all, is asked too. If it fails, a
+                // missing transaction is an error (not "doesn't exist"), and a short signature list is used as it is.
+                if (n < nodes.lastIndex && solanaMaybePruned(method, params, r)) {
+                    if (method == "getSignaturesForAddress") partial = r
+                    break
+                }
                 return r
             } catch (e: Exception) {
                 last = e
@@ -582,7 +591,15 @@ internal fun solanaCall(method: String, params: JSONArray): JSONObject {
             }
         }
     }
+    partial?.let { return it }
     throw last ?: IOException("Solana RPC error")
+}
+
+/** Whether publicnode's answer may be cut short by its one-day memory: no transaction, or fewer signatures than asked. */
+internal fun solanaMaybePruned(method: String, params: JSONArray, r: JSONObject): Boolean = when (method) {
+    "getTransaction" -> r.isNull("result")
+    "getSignaturesForAddress" -> (r.optJSONArray("result")?.length() ?: 0) < (params.optJSONObject(1)?.optInt("limit", 1000) ?: 1000)
+    else -> false
 }
 
 private fun solana(a: String, p: Map<String, Double>): ChainResult {

@@ -27,6 +27,23 @@ class LogicTest {
         assertEquals(setOf(inT, outT), picked.toSet())
     }
 
+    @Test fun lateNoticedPaymentStillMatches() {
+        // Paid at 07:09 while the app was closed, noticed at 11:27.
+        val paid = t(true, "112.8", 7 * 3_600_000L, hash = "h")
+        assertEquals(listOf(paid), pickTransfers(listOf(paid), BigDecimal("112.8"), 11 * 3_600_000L + 27 * 60_000L))
+        // But not one from more than a day before.
+        assertTrue(pickTransfers(listOf(paid), BigDecimal("112.8"), 7 * 3_600_000L + 25 * 3_600_000L).isEmpty())
+    }
+
+    @Test fun mergeDropsLateAlertOfAHistoryTransfer() {
+        val history = Triple("w", "Solana", t(true, "112.8", 7 * 3_600_000L, hash = "h", url = "u", symbol = "USDC"))
+        val alert = Triple("w", "Solana", t(true, "112.8", 11 * 3_600_000L, symbol = "USDC"))
+        assertEquals(listOf(history), mergeRecent(listOf(alert, history)))
+        // An alert from before the transfer is a different payment.
+        val earlier = Triple("w", "Solana", t(true, "112.8", 3 * 3_600_000L, symbol = "USDC"))
+        assertEquals(2, mergeRecent(listOf(earlier, history)).size)
+    }
+
     @Test fun noMatchGivesNothing() {
         assertTrue(pickTransfers(listOf(t(true, "1", 1_000)), BigDecimal("-7"), 2_000).isEmpty())
     }
@@ -152,6 +169,16 @@ class LogicTest {
         // A real USDT holder and its token account, read from a transfer on the chain.
         assertEquals("A2LJBG8uQbUEjgjRmuq2WU8FR9TExjfc1XH72KeCzCeJ",
             associatedTokenAccount("GPUnAX82D88Z7eyLwMupCghjHBHHhucwrFk8BfYyvU26", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"))
+    }
+
+    @Test fun solanaAsksTheBackupWhenPublicnodeMayHaveForgotten() {
+        fun sigs(n: Int) = org.json.JSONObject().put("result", org.json.JSONArray().apply { repeat(n) { put(org.json.JSONObject()) } })
+        val ask20 = org.json.JSONArray().put("addr").put(org.json.JSONObject().put("limit", 20))
+        assertTrue(solanaMaybePruned("getSignaturesForAddress", ask20, sigs(3)))
+        assertFalse(solanaMaybePruned("getSignaturesForAddress", ask20, sigs(20)))
+        assertTrue(solanaMaybePruned("getTransaction", org.json.JSONArray().put("sig"), org.json.JSONObject().put("result", org.json.JSONObject.NULL)))
+        assertFalse(solanaMaybePruned("getTransaction", org.json.JSONArray().put("sig"), org.json.JSONObject().put("result", org.json.JSONObject())))
+        assertFalse(solanaMaybePruned("getBalance", org.json.JSONArray().put("addr"), org.json.JSONObject()))
     }
 
     @Test fun versionComparison() {

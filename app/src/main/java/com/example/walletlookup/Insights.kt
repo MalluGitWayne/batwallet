@@ -146,7 +146,7 @@ suspend fun findTransfers(raw: String, network: String, symbol: String, change: 
             else EVM_CHAINS.firstOrNull { it.name == network }?.tokens?.firstOrNull { it.symbol.startsWith(symbol, ignoreCase = true) }
                 ?.let { Triple(it.contract, it.decimals, symbol.uppercase()) }
         }
-        val window = time - 3 * 3_600_000L..time + 15 * 60_000L
+        val window = time - LATE_ALERT_MS..time + 15 * 60_000L
         val candidates: List<Transfer>? = when {
             evm && node != null && token != null ->
                 runCatching { logWindow(node, a, time, token.first, token.second, token.third) }.getOrNull()
@@ -305,11 +305,16 @@ private val FEE_ALLOWANCE: Map<String, BigDecimal> = mapOf(
  * whose amounts add up to it. Only transfers from 3 hours before [time] to 15 minutes after count (and ones whose
  * time isn't known), so an old transfer of the same amount is never taken for a new one.
  */
+/** How long before an alert's time its transfer may have happened (it's noticed at the next check, maybe a day later). */
+internal const val LATE_ALERT_MS = 24 * 3_600_000L
+
 fun pickTransfers(candidates: List<Transfer>, change: java.math.BigDecimal, time: Long): List<Transfer> {
     val incoming = change.signum() > 0
     val target = change.abs()
     val near = candidates.filter { it.time <= 0 || it.time in time - 3 * 3_600_000L..time + 15 * 60_000L }
-    near.filter { it.incoming == incoming && it.amount.compareTo(target) == 0 }
+    // One transfer of exactly the change may be up to a day older: a payment that arrived while the phone was off or
+    // the app closed is only noticed (and timed) at the next check.
+    candidates.filter { (it.time <= 0 || it.time in time - LATE_ALERT_MS..time + 15 * 60_000L) && it.incoming == incoming && it.amount.compareTo(target) == 0 }
         .minByOrNull { kotlin.math.abs(it.time - time) }?.let { return listOf(it) }
     if (!incoming) {
         near.filter { t ->

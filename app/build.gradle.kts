@@ -11,8 +11,8 @@ android {
         applicationId = "com.malluwayne.batwallet"
         minSdk = 28
         targetSdk = 36
-        versionCode = 70
-        versionName = "21.1"
+        versionCode = 71
+        versionName = "21.2"
     }
 
     // Release key: kept outside the project (path and password in ~/.gradle/gradle.properties, never in git).
@@ -61,6 +61,7 @@ dependencies {
     implementation("androidx.profileinstaller:profileinstaller:1.4.1")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }
 
 // The logic checks (app/src/test) run before every release build, so a broken one stops the release.

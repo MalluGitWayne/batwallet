@@ -513,11 +513,21 @@ internal fun mergeRecent(all: List<Triple<String, String, Transfer>>): List<Trip
         val dup = unique.any { (w, _, u) ->
             w == x.first && u.incoming == t.incoming && u.symbol == t.symbol &&
                 (if (t.hash != null && u.hash != null) u.hash.equals(t.hash, true)
-                else u.amount.compareTo(t.amount) == 0 && kotlin.math.abs(u.time - t.time) < 3_600_000)
+                else u.amount.compareTo(t.amount) == 0 && sameAlert(t, u))
         }
         if (!dup) unique += x
     }
     return unique.sortedByDescending { it.third.time }.take(30)
+}
+
+/**
+ * Whether two same-amount entries without a shared ID are one transfer: within an hour, or the alert (no ID) up to a
+ * day after the transfer it noticed late (the phone was off or the app closed when it arrived).
+ */
+private fun sameAlert(a: Transfer, b: Transfer): Boolean {
+    if (kotlin.math.abs(a.time - b.time) < 3_600_000) return true
+    val (alert, tx) = when { a.hash == null && b.hash != null -> a to b; b.hash == null && a.hash != null -> b to a; else -> return false }
+    return alert.time - tx.time in 0..LATE_ALERT_MS
 }
 
 private fun activeNetworks(results: List<ChainResult>): Set<String>? =
