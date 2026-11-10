@@ -48,7 +48,7 @@ fun shareWallet(context: Context, name: String?, address: String) {
         appendLine()
         append("Shared with Batwallet")
     }
-    val send = Intent(Intent.ACTION_SEND).putExtra(Intent.EXTRA_TEXT, text).putExtra(Intent.EXTRA_SUBJECT, name ?: "Wallet address")
+    val send = Intent(Intent.ACTION_SEND).putExtra(Intent.EXTRA_TEXT, text).putExtra(Intent.EXTRA_SUBJECT, name ?: tr("Wallet address"))
     preparingShare = true
     val scope = (context as? LifecycleOwner)?.lifecycleScope ?: shareScope
     scope.launch {
@@ -61,7 +61,7 @@ fun shareWallet(context: Context, name: String?, address: String) {
         } else {
             send.setType("text/plain")
         }
-        context.startActivity(Intent.createChooser(send, "Share wallet"))
+        context.startActivity(Intent.createChooser(send, tr("Share wallet")))
     }.invokeOnCompletion { preparingShare = false } // also when the screen closed first
 }
 
@@ -87,7 +87,7 @@ private fun qrCard(context: Context, name: String?, network: String, raw: String
     // Title and network badge.
     var y = 190f
     val title = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = ink; textSize = 58f; typeface = semi; textAlign = Paint.Align.CENTER }
-    c.drawText((name?.takeIf { it.isNotBlank() } ?: "Wallet address").take(24), w / 2f, y, title)
+    c.drawText((name?.takeIf { it.isNotBlank() } ?: tr("Wallet address")).take(24), w / 2f, y, title)
     y += 40f
     val badgeText = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = ink; textSize = 34f; typeface = semi; textAlign = Paint.Align.CENTER }
     val bw = badgeText.measureText(network) + 56f + 52f
@@ -159,8 +159,8 @@ fun shareHistoryCsv(context: Context, name: String?, address: String, history: L
     val uri = FileProvider.getUriForFile(context, context.packageName + ".files", file)
     val send = Intent(Intent.ACTION_SEND).setType("text/csv")
         .putExtra(Intent.EXTRA_STREAM, uri)
-        .putExtra(Intent.EXTRA_SUBJECT, "Transaction history · ${name ?: rawAddress(address)}")
+        .putExtra(Intent.EXTRA_SUBJECT, tr("Transaction history") + " · ${name ?: rawAddress(address)}")
         .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     send.clipData = ClipData.newRawUri("CSV", uri)
-    context.startActivity(Intent.createChooser(send, "Export history"))
+    context.startActivity(Intent.createChooser(send, tr("Export history")))
 }

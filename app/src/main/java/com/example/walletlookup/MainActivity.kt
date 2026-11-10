@@ -389,6 +389,8 @@ class MainActivity : FragmentActivity() {
     override fun onResume() {
         super.onResume()
         if (locked && !authInProgress) authenticate()
+        // With the lock on, the Recents card shows no picture of the app (balances), like a banking app.
+        if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(!(lockEnabled && canAuthenticate()))
     }
 
     override fun onStop() {
@@ -683,8 +685,10 @@ private fun App(
         // Shared text waits until the app is unlocked, so its dialog can't open on top of the lock screen.
         val text = shared?.takeIf { !locked } ?: return@LaunchedEffect
         onSharedHandled()
-        // Full-screen pages would cover the result, so shared text always lands on Home.
+        // Full-screen pages would cover the result, so shared text always lands on Home (a fresh start: no Back
+        // trail to the wallet you were on).
         scanning = false; txInfo = null; homeTx = null; historyFor = null
+        trail = emptyList(); fromWallets = false
         tab = TAB_HOME
         if (!handleText(text)) {
             android.widget.Toast.makeText(context, tr("No wallet address found"), android.widget.Toast.LENGTH_SHORT).show()
@@ -1011,7 +1015,8 @@ private fun App(
     LaunchedEffect(address, loading) {
         val a = address
         if (tokensFor != a) { tokens = null; tokensFor = null }
-        if (loading || lookedUp?.first != a || resultsFor != a || results.isEmpty() || detect(a) == null || tokensFor == a) {
+        // Fetched again after every balance load (pull-down, Retry), not only the first time.
+        if (loading || lookedUp?.first != a || resultsFor != a || results.isEmpty() || detect(a) == null) {
             return@LaunchedEffect
         }
         tokens = try {
@@ -1250,8 +1255,10 @@ private fun App(
                     collapsedInit = store.collapsedGroups,
                     onCollapsedChange = { store.collapsedGroups = it },
                     onSwapGroups = { a, b, current ->
-                        // Dragging a folder switches to your own order, starting from what is on screen.
-                        val list = current.toMutableList()
+                        // Dragging a folder switches to your own order, starting from what is on screen. Folders not
+                        // on screen (only archived wallets, hidden as small) keep their place in a custom order.
+                        val list = (if (walletSort == WalletSort.CUSTOM) (groupOrder + current) else (current + groupOrder))
+                            .distinct().toMutableList()
                         val i = list.indexOf(a)
                         val j = list.indexOf(b)
                         if (i >= 0 && j >= 0) {
@@ -1266,7 +1273,9 @@ private fun App(
                         // Keep exactly what was on screen as the new custom order.
                         val pos = order.withIndex().associate { (i, a) -> a to i }
                         updateSaved(saved.sortedBy { pos[it.address] ?: Int.MAX_VALUE })
-                        groupOrder = folders; store.groupOrder = folders
+                        // Folders not on screen (archived, hidden as small) keep their place after the shown ones.
+                        val all = (folders + groupOrder).distinct()
+                        groupOrder = all; store.groupOrder = all
                         walletSort = WalletSort.CUSTOM; store.walletSort = WalletSort.CUSTOM
                     },
                     onToggleHidden = toggleHidden,
@@ -1402,7 +1411,10 @@ private fun App(
     if (!locked) UpdateProgressDialog()
     var whatsNew by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) {
-        if (justUpdated(context, saved.isNotEmpty())) whatsNew = releaseNotes(BatApp.appVersion(context))
+        if (justUpdated(context, saved.isNotEmpty())) releaseNotes(BatApp.appVersion(context))?.let {
+            whatsNew = it
+            markUpdateSeen(context)
+        }
     }
     if (!locked) whatsNew?.let { WhatsNewDialog(BatApp.appVersion(context), it) { whatsNew = null } }
     // Open before the app locked: it stays (under the lock screen, which is a window above it), so its ID and search
@@ -1505,6 +1517,9 @@ private fun HomeTab(
     val type = detect(address)
     val twin = remember(address, saved) { lookalike(address, saved) }
     var showSave by remember { mutableStateOf(false) }
+    // Another address opened (shared from Telegram, say) while Save was open: close it, or saving would act on the
+    // new address with the old one's fields (and could replace a different wallet).
+    LaunchedEffect(address) { showSave = false }
     var showRecent by remember { mutableStateOf(false) }
 
     // On the overview the total card's sweeping light is the one updating sign, so the pull's dots only fill while
@@ -1945,10 +1960,15 @@ private fun WalletsTab(
     val pages = remember(saved, cache, sort, query, showArchived, hideSmall, groupOrder) { listOf(page(false), page(true)) }
     val current = pages[subPage]
 
-    /** Dragging while sorted by value or name first makes what's on screen your own order, then moves from there. */
+    /**
+     * Dragging while sorted by value or name first makes what's on screen your own order, then moves from there.
+     * Both pages' order is kept: dragging a contact must not reshuffle the wallets (or their folders).
+     */
+    @Suppress("UNUSED_PARAMETER")
     fun adoptShownOrder(p: Page) {
         if (sort == WalletSort.CUSTOM) return
-        onAdoptOrder(p.sections.values.flatMap { ordered(it) }.map { it.address }, p.orderedNames)
+        onAdoptOrder(pages.flatMap { pg -> pg.sections.values.flatMap { ordered(it) }.map { it.address } },
+            pages.flatMap { it.orderedNames }.distinct())
     }
 
     Column(Modifier.fillMaxSize()) {

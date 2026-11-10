@@ -64,6 +64,9 @@ object Alerts {
     private val online = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build()
     private val checking = Mutex()
     private var checkRuns = 0
+    /** When the last check of every network ran (0: not yet in this process). */
+    private var lastFullCheck = 0L
+    private const val FULL_CHECK_MS = 10 * 60_000L
     /** Time for the search for missing details per check run (all wallets together), and from Home. */
     private const val FILL_BUDGET_MS = 15_000L
     /** Time for each lookup on an alert's own path (balances, the transfers behind it): it alerts without them. */
@@ -410,29 +413,33 @@ object Alerts {
         val store = Store(context)
         if (!store.alertsEnabled) return@withLock
         // Notifications in the app's language and currency, even when the app isn't open.
-        I18n.load(context)
-        I18n.lang = store.language
+        useAppLanguage(context, store)
         fiat = store.currency
         fiatRate = store.currencyRate
         if (historyPrefs == null) historyPrefs = context.getSharedPreferences("history", Context.MODE_PRIVATE) // saved prices
 
-        // Lighter checks: only the networks a wallet actually uses, with a full sweep every 20th run
-        // (≈10 min in instant mode) to catch money arriving on a new network.
-        val full = checkRuns++ % 20 == 0
+        // Lighter checks: only the networks a wallet actually uses, with a full sweep every 10 minutes (also in
+        // battery saver, where runs are 15 minutes apart) to catch money arriving on a new network.
+        val runAt = System.currentTimeMillis()
+        val full = runAt - lastFullCheck >= FULL_CHECK_MS
+        if (full) lastFullCheck = runAt
+        checkRuns++
         // Known exchange wallets (Binance's own, say) move other people's money every few seconds: nothing to alert.
         val wallets = store.loadAddresses().filter { !it.contact && !it.archived && knownPlatform(it.address) == null }
         for (w in wallets) {
             val used = if (full) null else store.loadCache(w.address)?.results
                 ?.filter { it.active && it.error == null }?.map { it.network }?.toSet()?.ifEmpty { null }
+            val old = store.loadSnapshot(w.address)
             val fresh = try {
-                snapshot(w.address, used)
+                // The starting balances cover every network: one missing there would later be taken in silently as
+                // "seen for the first time", and a payment on it never alerted.
+                snapshot(w.address, if (old == null) null else used)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 continue
             }
             if (fresh.isEmpty()) continue
-            val old = store.loadSnapshot(w.address)
             if (old == null) {
                 // First check: just remember the starting balances.
                 if (stillSaved(store, w.address)) store.saveSnapshot(w.address, fresh)
@@ -531,7 +538,7 @@ object Alerts {
                 // Respect the "only alert above" setting; small coin moves (gas fees) are skipped when a minimum is set.
                 val min = BigDecimal(store.alertMin)
                 val worth = changes.filter { (key, diff) ->
-                    key !in fees && (!exchange || diff.signum() > 0) &&
+                    key !in fees && (!exchange || diff.signum() > 0) && !isCoinDust(diff, key.substringBefore("|")) &&
                         (if (key.substringBefore("|") in ALERT_STABLES) diff.abs() >= min else min.signum() == 0)
                 }
 
@@ -565,7 +572,9 @@ object Alerts {
                     // Muted wallets: refreshed and logged above, never a notification. Nothing left worth showing: no
                     // notification at all (it used to say "0 payments").
                     if (worth.isEmpty() || w.muted || payments.isEmpty()) return@withContext
-                    val balance = store.loadCache(w.address)?.totals?.usd?.let { tr("Balance") + " " + money(it) }
+                    // "Hide balances" keeps the wallet's total off the lock screen too.
+                    val balance = if (store.hideBalances) null
+                        else store.loadCache(w.address)?.totals?.usd?.let { tr("Balance") + " " + money(it) }
                     // Several payments to one wallet within 2 minutes: one notification, updated, instead of a stack.
                     val nowMs = System.currentTimeMillis()
                     val earlier = burst[w.address]?.takeIf { nowMs - it.first < 120_000L }

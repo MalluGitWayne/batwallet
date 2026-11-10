@@ -75,11 +75,23 @@ fun ScannerScreen(onResult: (String) -> Unit, onClose: () -> Unit) {
     var granted by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
     }
+    // Camera refused: the scanner stays open (Import photo needs no camera) and says how to allow it.
+    var refused by remember { mutableStateOf(false) }
     val ask = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
         granted = ok
-        if (!ok) onClose()
+        refused = !ok
     }
     LaunchedEffect(Unit) { if (!granted) ask.launch(Manifest.permission.CAMERA) }
+    // Back from Settings with the camera allowed: start scanning.
+    val owner = LocalLifecycleOwner.current
+    DisposableEffect(owner) {
+        val watch = LifecycleEventObserver { _, e ->
+            if (e == Lifecycle.Event.ON_RESUME && !granted &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) granted = true
+        }
+        owner.lifecycle.addObserver(watch)
+        onDispose { owner.lifecycle.removeObserver(watch) }
+    }
     BackHandler(onBack = onClose)
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -128,8 +140,18 @@ fun ScannerScreen(onResult: (String) -> Unit, onClose: () -> Unit) {
             Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 36.dp).fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
+            if (refused && !granted) {
+                Text("Camera not allowed", color = Color.White, textAlign = TextAlign.Center, style = MaterialTheme.typography.titleMedium)
+                androidx.compose.material3.TextButton(onClick = {
+                    runCatching {
+                        context.startActivity(android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.fromParts("package", context.packageName, null)))
+                    }
+                }) { Text("Open settings", color = Color.White) }
+                Spacer(Modifier.height(8.dp))
+            }
             Text(
-                if (reading) "Reading…" else "Scan a wallet QR code",
+                if (reading) "Reading…" else if (refused && !granted) "Or import a photo of the QR code" else "Scan a wallet QR code",
                 color = Color.White.copy(alpha = 0.85f),
                 textAlign = TextAlign.Center,
                 style = MaterialTheme.typography.bodyMedium,
@@ -166,7 +188,6 @@ fun decodeQrImage(context: android.content.Context, uri: android.net.Uri): Strin
 
 
 /** QR code image for an address (used by "Receive"). */
-fun qrBitmap(text: String, sizePx: Int = 720): Bitmap = crispQr(text, sizePx)
 
 /**
  * A perfectly square QR: every module is the same whole number of pixels (stretching a QR to an arbitrary size
@@ -198,7 +219,7 @@ fun crispQr(
 
 @Composable
 fun QrImage(text: String, modifier: Modifier = Modifier) {
-    val bmp = remember(text) { runCatching { qrBitmap(text) }.getOrNull() }
+    val bmp = remember(text) { runCatching { crispQr(text, 720) }.getOrNull() }
     if (bmp != null) {
         Image(
             bmp.asImageBitmap(), contentDescription = null,

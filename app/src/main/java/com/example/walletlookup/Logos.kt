@@ -134,7 +134,7 @@ fun drawCoinLogo(context: Context, c: Canvas, symbol: String, cx: Float, cy: Flo
     c.drawCircle(cx, cy, r, Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = android.graphics.Color.argb(255,
         (color.red * 255).toInt(), (color.green * 255).toInt(), (color.blue * 255).toInt()) })
     val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        this.color = android.graphics.Color.WHITE; textSize = r * 0.9f; textAlign = Paint.Align.CENTER; isFakeBoldText = true
+        this.color = if (color == Color(0xFFFCD34D)) android.graphics.Color.BLACK else android.graphics.Color.WHITE; textSize = r * 0.9f; textAlign = Paint.Align.CENTER; isFakeBoldText = true
     }
     c.drawText(letter, cx, cy + r * 0.32f, text)
 }

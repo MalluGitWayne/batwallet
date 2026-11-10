@@ -131,4 +131,19 @@ class LookupFixesTest {
         // A known exchange wallet gets the exchange card, never this note.
         assertNull(exchangeNote("0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE", 50_000))
     }
+
+    @Test fun eip681PayLinksGiveTheAddress() {
+        assertEquals(evm, cleanAddress("ethereum:pay-$evm@1?value=1"))
+        // A NEAR name that starts with "pay-" is left alone.
+        assertEquals("pay-me.near", cleanAddress("pay-me.near"))
+    }
+
+    @Test fun capitalisedNearNamesAreStillNear() {
+        assertEquals(AddrType.NEAR, detect("Alice.near"))
+    }
+
+    @Test fun realTonUsdtIsKnownInItsRawForm() {
+        val b = java.util.Base64.getUrlDecoder().decode(USDT_TON)
+        assertEquals(USDT_TON_RAW, "${b[1]}:" + b.copyOfRange(2, 34).joinToString("") { "%02x".format(it) })
+    }
 }

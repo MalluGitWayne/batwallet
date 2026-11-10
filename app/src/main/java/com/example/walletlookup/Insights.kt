@@ -96,7 +96,6 @@ internal const val TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f16
  */
 private val historyLimitLocal = ThreadLocal<Int>()
 internal val historyLimit: Int get() = historyLimitLocal.get() ?: 25
-private val LIMIT: Int get() = historyLimit
 
 private data class EvmHist(
     val name: String, val chainId: Long, val blockscout: String?,
@@ -147,14 +146,21 @@ suspend fun findTransfers(raw: String, network: String, symbol: String, change: 
                 ?.let { Triple(it.contract, it.decimals, symbol.uppercase()) }
         }
         val window = time - LATE_ALERT_MS..time + 15 * 60_000L
+        // Log scans look 3 hours back first (cheap, and a busy wallet stays under the cap), then a day back for a
+        // payment that was only noticed late (the phone was off).
+        fun scanned(scan: (Long) -> List<Transfer>): List<Transfer>? {
+            val near = runCatching { scan(3 * 3_600_000L) }.getOrNull()
+            if (near != null && pickTransfers(near, change, time).isNotEmpty()) return near
+            return runCatching { scan(LATE_ALERT_MS) }.getOrNull() ?: near
+        }
         val candidates: List<Transfer>? = when {
             evm && node != null && token != null ->
-                runCatching { logWindow(node, a, time, token.first, token.second, token.third) }.getOrNull()
+                scanned { back -> logWindow(node, a, time, back, token.first, token.second, token.third) }
             // Plain TRX (Tron's own coin): asked for directly, around that time.
-            network == "Tron" && symbol.equals("TRX", true) -> runCatching { tronCoinWindow(a, time) }.getOrNull()
+            network == "Tron" && symbol.equals("TRX", true) -> scanned { back -> tronCoinWindow(a, time, back) }
             // BNB / ETH / POL: from the free coin-transfer lists (Binplorer, Ethplorer, Routescan, Blockscout).
             evm && !symbol.uppercase().startsWith("USD") -> EVM_HIST.firstOrNull { it.name == network }?.let { h ->
-                runCatching { evmNativeTransfers(h.name, h.chainId, h.blockscout, h.routescan, h.txBase, a) }.getOrNull()
+                runCatching { evmNativePage(h.name, h.chainId, h.blockscout, h.routescan, h.txBase, a).items }.getOrNull()
                     ?.filter { it.symbol.equals(symbol, true) && it.time in window }
             }
             else -> {
@@ -171,9 +177,9 @@ suspend fun findTransfers(raw: String, network: String, symbol: String, change: 
         pickTransfers(candidates.orEmpty(), change, time)
     }
 
-/** Plain TRX transfers in and out of [a] from 3 hours before [time] to 15 minutes after. */
-private fun tronCoinWindow(a: String, time: Long): List<Transfer> =
-    tronCoinPage(a, time - 3 * 3_600_000L, time + 15 * 60_000L).items
+/** Plain TRX transfers in and out of [a] from [back] millis before [time] to 15 minutes after. */
+private fun tronCoinWindow(a: String, time: Long, back: Long): List<Transfer> =
+    tronCoinPage(a, time - back, time + 15 * 60_000L).items
 
 /**
  * Plain TRX transfers in and out of [a] between [from] and [to] (epoch millis; TronGrid, Tronscan as backup). They
@@ -300,14 +306,14 @@ private val FEE_ALLOWANCE: Map<String, BigDecimal> = mapOf(
     "XTZ" to "0.1", "APT" to "0.01",
 ).mapValues { BigDecimal(it.value) }
 
-/**
- * One transfer of exactly [change], else (a coin sent) one a fee's worth smaller, else the newest ones up to [time]
- * whose amounts add up to it. Only transfers from 3 hours before [time] to 15 minutes after count (and ones whose
- * time isn't known), so an old transfer of the same amount is never taken for a new one.
- */
 /** How long before an alert's time its transfer may have happened (it's noticed at the next check, maybe a day later). */
 internal const val LATE_ALERT_MS = 24 * 3_600_000L
 
+/**
+ * One transfer of exactly [change] (up to [LATE_ALERT_MS] old), else (a coin sent) one a fee's worth smaller, else the
+ * newest ones up to [time] whose amounts add up to it. Those only count from 3 hours before [time] to 15 minutes after
+ * (and ones whose time isn't known), so an old transfer of the same amount is never taken for a new one.
+ */
 fun pickTransfers(candidates: List<Transfer>, change: java.math.BigDecimal, time: Long): List<Transfer> {
     val incoming = change.signum() > 0
     val target = change.abs()
@@ -332,8 +338,8 @@ fun pickTransfers(candidates: List<Transfer>, change: java.math.BigDecimal, time
     return emptyList()
 }
 
-/** Every transfer of the [token] in and out of [a] from 3 hours before [time] to 15 minutes after. */
-private fun logWindow(c: EvmHist, a: String, time: Long, token: String, decimals: Int, symbol: String): List<Transfer> {
+/** Every transfer of the [token] in and out of [a] from [back] millis before [time] to 15 minutes after. */
+private fun logWindow(c: EvmHist, a: String, time: Long, back: Long, token: String, decimals: Int, symbol: String): List<Transfer> {
     val node = LOG_NODES.getValue(c.chainId)
     val me = "0x" + a.removePrefix("0x").lowercase().padStart(64, '0')
     fun call(id: Int, method: String, params: JSONArray) =
@@ -346,7 +352,7 @@ private fun logWindow(c: EvmHist, a: String, time: Long, token: String, decimals
     val tLatest = blockTime(latest)
     val perSec = (latest - back).toDouble() / maxOf(1L, tLatest - blockTime(back))
     fun blockAt(sec: Long) = (latest - ((tLatest - sec) * perSec).toLong()).coerceIn(0L, latest)
-    val from = blockAt(time / 1000 - 3 * 3600)
+    val from = blockAt((time - back) / 1000)
     val to = blockAt(time / 1000 + 15 * 60)
     val step = if (node.backupsFullRange) node.chunk else minOf(node.chunk, LogNode.BACKUP_SPAN)
     val ranges = generateSequence(from) { it + step }.takeWhile { it <= to }.map { it..minOf(to, it + step - 1) }.toList()
@@ -431,7 +437,7 @@ private suspend fun historyRaw(raw: String, networks0: Set<String>?): List<Histo
 
 private fun noHistoryNote(network: String) = tr("History for %s isn't available in the app yet.").replace("%s", network)
 
-private inline fun safeHistory(network: String, block: () -> History): History =
+internal inline fun safeHistory(network: String, block: () -> History): History =
     try { block() } catch (e: CancellationException) { throw e } catch (e: Exception) { History(network, error = friendlyError(e)) }
 
 /** Short, human error text instead of raw server responses. */
@@ -472,7 +478,7 @@ private fun evmHistory(c: EvmHist, a: String): Part {
 
 private fun routescanHistory(c: EvmHist, a: String): Part {
     val url = "https://api.routescan.io/v2/network/mainnet/evm/${c.chainId}/etherscan/api?module=account&action=tokentx" +
-        "&contractaddress=${c.token}&address=$a&page=1&offset=$LIMIT&sort=desc"
+        "&contractaddress=${c.token}&address=$a&page=1&offset=$historyLimit&sort=desc"
     return parseEtherscanStyle(c, a, JSONObject(http(url)))
 }
 
@@ -504,7 +510,7 @@ private fun blockscoutHistory(c: EvmHist, a: String): Part {
 
 private fun etherscanHistory(c: EvmHist, a: String): Part {
     val url = "https://api.etherscan.io/v2/api?chainid=${c.chainId}&module=account&action=tokentx" +
-        "&contractaddress=${c.token}&address=$a&page=1&offset=$LIMIT&sort=desc&apikey=${URLEncoder.encode(etherscanKey, "UTF-8")}"
+        "&contractaddress=${c.token}&address=$a&page=1&offset=$historyLimit&sort=desc&apikey=${URLEncoder.encode(etherscanKey, "UTF-8")}"
     val j = JSONObject(http(url))
     if (j.optString("status") != "1" && !j.optString("message").contains("No transactions", true)) {
         // The key doesn't cover this network (free plan): let the next free source answer.
@@ -533,7 +539,7 @@ private fun parseEtherscanStyle(c: EvmHist, a: String, j: JSONObject): Part {
             c.txBase + o.getString("hash"), o.getString("hash"), from, to, c.symbol,
         )
     }
-    return sourcePage(items, arr.length(), LIMIT, items.minOfOrNull { it.time } ?: 0L)
+    return sourcePage(items, arr.length(), historyLimit, items.minOfOrNull { it.time } ?: 0L)
 }
 
 /** Where history found by scanning a node's event logs is kept (set at start-up), so each visit only scans new blocks. */
@@ -589,8 +595,8 @@ private val LOG_NODES = mapOf(
  */
 private fun logHistory(c: EvmHist, a: String): Part {
     // Requests per visit (more after each Load more), and how many transfers to look for.
-    val maxRequests = 4 + (LIMIT - 25) / 50 * 4
-    val want = LIMIT
+    val maxRequests = 4 + (historyLimit - 25) / 50 * 4
+    val want = historyLimit
     val node = LOG_NODES.getValue(c.chainId)
     val key = "loghist:${c.chainId}:${a.lowercase()}"
     val me = "0x" + a.removePrefix("0x").lowercase().padStart(64, '0')
@@ -680,7 +686,7 @@ private fun logHistory(c: EvmHist, a: String): Part {
 
     // Times for the blocks we show (stored, so they are fetched only once).
     val logs = found.values.sortedByDescending { it.getLong("b") }
-    val missing = logs.take(LIMIT).filter { !it.has("ts") }.map { it.getLong("b") }.distinct()
+    val missing = logs.take(historyLimit).filter { !it.has("ts") }.map { it.getLong("b") }.distinct()
     if (missing.isNotEmpty()) runCatching {
         missing.chunked(20).forEach { part ->
             val batch = JSONArray()
@@ -700,7 +706,7 @@ private fun logHistory(c: EvmHist, a: String): Part {
     historyPrefs?.edit()?.putString(key, JSONObject().put("newest", newest).put("oldest", oldest).put("start", reachedStart)
         .put("logs", JSONArray(logs.take(500))).toString())?.apply()
 
-    val items = logs.take(LIMIT).map { l ->
+    val items = logs.take(historyLimit).map { l ->
         val from = l.getString("f")
         val to = l.getString("t")
         val incoming = to.equals(a, ignoreCase = true)
@@ -713,7 +719,7 @@ private fun logHistory(c: EvmHist, a: String): Part {
             .getJSONObject("result").getString("timestamp").removePrefix("0x"), 16).toLong()
     }.getOrNull() else null
     // Complete back to the oldest block scanned, or (more found than shown) to the oldest one shown.
-    val moreFound = logs.size > LIMIT
+    val moreFound = logs.size > historyLimit
     val reach = if (moreFound) items.map { it.time }.filter { it > 0 }.minOrNull() ?: 0L else (since ?: 0L) * 1000
     return Part(
         items, bounded = !reachedStart || moreFound, reach = reach, grows = true,
@@ -723,7 +729,7 @@ private fun logHistory(c: EvmHist, a: String): Part {
 }
 
 private fun tronHistory(a: String): History {
-    val asked = minOf(LIMIT, 200) // TronGrid's maximum
+    val asked = minOf(historyLimit, 200) // TronGrid's maximum
     val j = JSONObject(http("https://api.trongrid.io/v1/accounts/$a/transactions/trc20?limit=$asked&contract_address=$USDT_TRC20"))
     val arr = j.optJSONArray("data") ?: JSONArray()
     val items = (0 until arr.length()).map { i ->
@@ -746,7 +752,7 @@ private fun tronHistory(a: String): History {
     return historyOf("Tron", listOfNotNull(usdt, coins))
 }
 
-private const val APT_COIN = "0x1::aptos_coin::AptosCoin"
+internal const val APT_COIN = "0x1::aptos_coin::AptosCoin"
 private val APTOS_ARG = Regex("0x[0-9a-fA-F]{1,64}")
 
 /**
@@ -756,7 +762,7 @@ private val APTOS_ARG = Regex("0x[0-9a-fA-F]{1,64}")
 private val aptosAnswers = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, History>>()
 
 private suspend fun aptosCached(a: String): History {
-    val key = "${a.lowercase()}|$LIMIT"
+    val key = "${a.lowercase()}|$historyLimit"
     val now = System.currentTimeMillis()
     aptosAnswers[key]?.let { (t, h) -> if (now - t < 120_000) return h }
     return try {
@@ -775,7 +781,7 @@ private suspend fun aptosHistory(raw: String): History = coroutineScope {
     val a = "0x" + raw.removePrefix("0x").lowercase().padStart(64, '0')
     // USDT plus APT itself (as the old coin type and as its newer fungible-asset form, 0xa).
     val assets = """["$USDT_APTOS", "$APT_COIN", "0xa"]"""
-    val asked = minOf(LIMIT, APTOS_ROWS)
+    val asked = minOf(historyLimit, APTOS_ROWS)
     val query = """
         query { fungible_asset_activities(
             where: { owner_address: { _eq: "$a" }, asset_type: { _in: $assets }, is_transaction_success: { _eq: true } },
@@ -867,7 +873,7 @@ private fun tonHistory(a: String): History {
     val me = JSONObject(http("https://tonapi.io/v2/accounts/$enc")).getString("address").lowercase()
     fun oldestOf(events: JSONArray) =
         (0 until events.length()).map { events.getJSONObject(it).optLong("timestamp") }.filter { it > 0 }.minOrNull()?.times(1000) ?: 0L
-    val askedJettons = minOf(LIMIT, 100)
+    val askedJettons = minOf(historyLimit, 100)
     val j = JSONObject(http("https://tonapi.io/v2/accounts/$enc/jettons/$USDT_TON/history?limit=$askedJettons"))
     val events = j.getJSONArray("events")
     val items = mutableListOf<Transfer>()
@@ -878,8 +884,11 @@ private fun tonHistory(a: String): History {
             val act = actions.getJSONObject(k)
             if (act.optString("status") != "ok") continue // a transfer that failed is listed too
             val t = act.optJSONObject("JettonTransfer") ?: continue
+            // Only real USDT legs that involve this wallet (an event can hold other jettons' and other wallets' legs).
+            if (t.optJSONObject("jetton")?.optString("address")?.lowercase()?.let { it != USDT_TON_RAW } == true) continue
             val sender = t.optJSONObject("sender")?.optString("address")?.lowercase()
             val recipient = t.optJSONObject("recipient")?.optString("address")?.lowercase()
+            if (sender != me && recipient != me) continue
             val incoming = recipient == me
             items += Transfer(
                 incoming,
@@ -895,7 +904,7 @@ private fun tonHistory(a: String): History {
     // TON coin transfers too (from the same free API); under 0.01 TON is the "excess" dust that comes back with
     // every jetton transfer, left out.
     runCatching {
-        val askedCoins = minOf(LIMIT, 50)
+        val askedCoins = minOf(historyLimit, 50)
         val ev = JSONObject(http("https://tonapi.io/v2/accounts/$enc/events?limit=$askedCoins")).getJSONArray("events")
         val coins = mutableListOf<Transfer>()
         for (i in 0 until ev.length()) {
@@ -909,6 +918,7 @@ private fun tonHistory(a: String): History {
                 if (nano < 10_000_000L) continue
                 val sender = t.optJSONObject("sender")?.optString("address")?.lowercase()
                 val recipient = t.optJSONObject("recipient")?.optString("address")?.lowercase()
+                if (sender != me && recipient != me) continue
                 val incoming = recipient == me
                 coins += Transfer(
                     incoming, amount(BigInteger.valueOf(nano), 9), tonFriendly(if (incoming) sender else recipient),
@@ -1238,7 +1248,10 @@ object HistoryCache {
     }.getOrNull()
 
     fun save(address: String, list: List<History>) {
-        val ok = list.filter { it.error == null }
+        // A network that failed this time keeps what was saved for it before, instead of being dropped.
+        val before = load(address).orEmpty()
+        val ok = list.map { h -> if (h.error == null) h else before.firstOrNull { it.network == h.network } ?: h }
+            .filter { it.error == null }
         if (ok.isEmpty()) return
         memory[address.lowercase()] = ok
         val arr = JSONArray()

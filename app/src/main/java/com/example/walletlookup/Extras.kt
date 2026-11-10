@@ -14,7 +14,6 @@ import java.math.BigInteger
 import java.net.URLEncoder
 import java.time.Instant
 
-private val MAX: Int get() = historyLimit
 
 // ===================== Coin history (native coins) =====================
 
@@ -27,29 +26,26 @@ internal suspend fun coinHistory(type: AddrType, a: String, networks: Set<String
         fun wanted(network: String) = networks == null || network in networks
         listOfNotNull(
             if (wanted("Bitcoin")) async(Dispatchers.IO) {
-                safeCoin("Bitcoin") { esploraHistory("Bitcoin", "https://mempool.space/api", "BTC", "https://mempool.space/tx/", a) }
+                safeHistory("Bitcoin") { esploraHistory("Bitcoin", "https://mempool.space/api", "BTC", "https://mempool.space/tx/", a) }
             } else null,
             // Legacy 1…/3… addresses also exist on Bitcoin Cash. Both load at once.
             if (!a.lowercase().startsWith("bc1") && wanted("Bitcoin Cash")) async(Dispatchers.IO) {
-                safeCoin("Bitcoin Cash") { bchHistory(a) }
+                safeHistory("Bitcoin Cash") { bchHistory(a) }
             } else null,
         ).awaitAll()
     }
-    AddrType.LITECOIN -> listOf(safeCoin("Litecoin") {
+    AddrType.LITECOIN -> listOf(safeHistory("Litecoin") {
         esploraHistory("Litecoin", "https://litecoinspace.org/api", "LTC", "https://litecoinspace.org/tx/", a)
     })
-    AddrType.BITCOIN_CASH -> listOf(safeCoin("Bitcoin Cash") { bchHistory(a) })
-    AddrType.DOGECOIN -> listOf(safeCoin("Dogecoin") { dogeHistory(a) })
-    AddrType.XRP -> listOf(safeCoin("XRP Ledger") { xrpHistory(a) })
-    AddrType.STELLAR -> listOf(safeCoin("Stellar") { stellarHistory(a) })
-    AddrType.ALGORAND -> listOf(safeCoin("Algorand") { algorandHistory(a) })
-    AddrType.TEZOS -> listOf(safeCoin("Tezos") { tezosHistory(a) })
-    AddrType.SOLANA -> listOf(safeCoin("Solana") { solanaHistory(a) })
+    AddrType.BITCOIN_CASH -> listOf(safeHistory("Bitcoin Cash") { bchHistory(a) })
+    AddrType.DOGECOIN -> listOf(safeHistory("Dogecoin") { dogeHistory(a) })
+    AddrType.XRP -> listOf(safeHistory("XRP Ledger") { xrpHistory(a) })
+    AddrType.STELLAR -> listOf(safeHistory("Stellar") { stellarHistory(a) })
+    AddrType.ALGORAND -> listOf(safeHistory("Algorand") { algorandHistory(a) })
+    AddrType.TEZOS -> listOf(safeHistory("Tezos") { tezosHistory(a) })
+    AddrType.SOLANA -> listOf(safeHistory("Solana") { solanaHistory(a) })
     else -> null
 }
-
-private inline fun safeCoin(network: String, block: () -> History): History =
-    try { block() } catch (e: CancellationException) { throw e } catch (e: Exception) { History(network, error = friendlyError(e)) }
 
 /** Esplora (mempool.space, litecoinspace.org) lists the latest 25 confirmed transactions, whatever the limit. */
 private const val ESPLORA_PAGE = 25
@@ -93,7 +89,7 @@ private fun esploraHistory(name: String, base: String, sym: String, txBase: Stri
 }
 
 private fun bchHistory(a: String): History {
-    val arr = JSONArray(http("https://api.haskoin.com/bch/address/${URLEncoder.encode(a, "UTF-8")}/transactions/full?limit=$MAX"))
+    val arr = JSONArray(http("https://api.haskoin.com/bch/address/${URLEncoder.encode(a, "UTF-8")}/transactions/full?limit=$historyLimit"))
     // Haskoin answers with cashaddr addresses: compare on this address's own cashaddr (a legacy one converted).
     val me = bchKey(a)
     var oldest = 0L
@@ -120,7 +116,7 @@ private fun bchHistory(a: String): History {
             tx.optLong("time") * 1000, "https://blockchair.com/bitcoin-cash/transaction/$txid", txid,
             if (incoming) from else a, if (incoming) a else to, "BCH")
     }
-    return historyOf("Bitcoin Cash", listOf(sourcePage(items, arr.length(), MAX, oldest)))
+    return historyOf("Bitcoin Cash", listOf(sourcePage(items, arr.length(), historyLimit, oldest)))
 }
 
 /** A Bitcoin Cash address the way Haskoin writes it, minus the "bitcoincash:" prefix (a legacy 1…/3… one converted). */
@@ -195,7 +191,7 @@ private fun cashPolymod(values: List<Int>): Long {
 }
 
 private fun dogeHistory(a: String): History {
-    val asked = minOf(MAX * 2, 200)
+    val asked = minOf(historyLimit * 2, 200)
     val j = JSONObject(http("https://api.blockcypher.com/v1/doge/main/addrs/$a?limit=$asked"))
     val refs = j.optJSONArray("txrefs") ?: JSONArray()
     val byTx = linkedMapOf<String, Pair<Long, Long>>() // hash -> (net, time)
@@ -221,7 +217,7 @@ private fun dogeHistory(a: String): History {
 private val XRP_DROPS = Regex("[0-9]+")
 
 private fun xrpHistory(a: String): History {
-    val asked = minOf(MAX * 2, 400)
+    val asked = minOf(historyLimit * 2, 400)
     val body = JSONObject().put("method", "account_tx")
         .put("params", JSONArray().put(JSONObject().put("account", a).put("limit", asked)))
     val result = JSONObject(http("https://xrplcluster.com/", body.toString())).getJSONObject("result")
@@ -255,7 +251,7 @@ private fun xrpHistory(a: String): History {
 }
 
 private fun stellarHistory(a: String): History {
-    val asked = minOf(MAX * 2, 200)
+    val asked = minOf(historyLimit * 2, 200)
     val recs = JSONObject(http("https://horizon.stellar.org/accounts/$a/payments?order=desc&limit=$asked"))
         .getJSONObject("_embedded").getJSONArray("records")
     var oldest = 0L
@@ -269,7 +265,8 @@ private fun stellarHistory(a: String): History {
             "create_account" -> listOf(r.optString("funder"), r.optString("account"), r.optString("starting_balance"), "XLM")
             else -> return@mapNotNull null
         }
-        if (sym !in setOf("XLM", "USDT", "USDC")) return@mapNotNull null
+        // Anyone can issue an asset coded "USDC": only the real issuers' coins count (as in the balance).
+        if (sym != "XLM" && (r.optString("type") != "payment" || !isStellarStable(sym, r.optString("asset_issuer")))) return@mapNotNull null
         val incoming = to == a
         val hash = r.optString("transaction_hash")
         Transfer(incoming, BigDecimal(amt), if (incoming) from else to, Instant.parse(r.getString("created_at")).toEpochMilli(),
@@ -279,7 +276,7 @@ private fun stellarHistory(a: String): History {
 }
 
 private fun algorandHistory(a: String): History {
-    val asked = minOf(MAX * 2, 1000)
+    val asked = minOf(historyLimit * 2, 1000)
     val txs = JSONObject(http("https://mainnet-idx.algonode.cloud/v2/accounts/$a/transactions?limit=$asked")).getJSONArray("transactions")
     val oldest = (0 until txs.length()).map { txs.getJSONObject(it).optLong("round-time") }.filter { it > 0 }.minOrNull()?.times(1000) ?: 0L
     val items = (0 until txs.length()).mapNotNull { i ->
@@ -303,7 +300,7 @@ private fun algorandHistory(a: String): History {
 }
 
 private fun tezosHistory(a: String): History {
-    val arr = JSONArray(http("https://api.tzkt.io/v1/accounts/$a/operations?type=transaction&limit=$MAX&sort.desc=id"))
+    val arr = JSONArray(http("https://api.tzkt.io/v1/accounts/$a/operations?type=transaction&limit=$historyLimit&sort.desc=id"))
     val oldest = (0 until arr.length()).mapNotNull { i ->
         runCatching { Instant.parse(arr.getJSONObject(i).getString("timestamp")).toEpochMilli() }.getOrNull()
     }.minOrNull() ?: 0L
@@ -318,7 +315,7 @@ private fun tezosHistory(a: String): History {
         Transfer(incoming, amount(BigInteger.valueOf(mutez), 6), if (incoming) from else to,
             Instant.parse(o.getString("timestamp")).toEpochMilli(), "https://tzkt.io/$hash", hash, from, to, "XTZ")
     }
-    return historyOf("Tezos", listOf(sourcePage(items, arr.length(), MAX, oldest)))
+    return historyOf("Tezos", listOf(sourcePage(items, arr.length(), historyLimit, oldest)))
 }
 
 /** Solana's USDT and USDC mints (history, balances and transaction lookup all use this one list). */
@@ -340,7 +337,7 @@ private fun solanaHistory(a: String): History {
     }
     // USDT / USDC arrive in separate token accounts, so their transactions are listed under those accounts.
     val tokenAccounts = runCatching { solanaTokenAccounts(a, SOL_STABLES.keys).values.map { it.first } }.getOrDefault(emptyList())
-    val sigs = (sigsOf(a, minOf(MAX, 20), 20) + tokenAccounts.flatMap { runCatching { sigsOf(it, 10, 10) }.getOrDefault(emptyList()) }).distinct()
+    val sigs = (sigsOf(a, minOf(historyLimit, 20), 20) + tokenAccounts.flatMap { runCatching { sigsOf(it, 10, 10) }.getOrDefault(emptyList()) }).distinct()
     // Four at a time (one by one took most of a minute). The pool's threads don't carry a background search's time
     // budget by themselves, so each task is given it; and the waits for them end with it too.
     // Two at a time: four set off the free RPC's rate limit, and every refused read used to vanish silently.
@@ -423,10 +420,6 @@ private fun solanaTransfer(a: String, sig: String): Transfer? {
     return Transfer(incoming, amount(BigInteger.valueOf(kotlin.math.abs(delta)), 9), other, time, url, sig,
         if (incoming) other else a, if (incoming) a else other, "SOL")
 }
-/** Native-coin transfers on an EVM network, from whichever free source covers it. */
-internal fun evmNativeTransfers(name: String, chainId: Long, blockscout: String?, routescan: Boolean, txBase: String, a: String): List<Transfer> =
-    evmNativePage(name, chainId, blockscout, routescan, txBase, a).items
-
 /** Ethplorer / Binplorer list at most 50 transactions per request with the free key. */
 private const val PLORER_MAX = 50
 
@@ -450,7 +443,7 @@ internal fun evmNativePage(name: String, chainId: Long, blockscout: String?, rou
             Transfer(incoming, amount(v, 18), if (incoming) from else to, time,
                 txBase + o.getString("hash"), o.getString("hash"), from, to, sym)
         }
-        return sourcePage(items, arr.length(), MAX, oldest)
+        return sourcePage(items, arr.length(), historyLimit, oldest)
     }
     fun etherscanStyle(url: String): Part {
         val j = JSONObject(http(url))
@@ -458,7 +451,7 @@ internal fun evmNativePage(name: String, chainId: Long, blockscout: String?, rou
     }
     /** Ethplorer (Ethereum) / Binplorer (BSC): free with their public "freekey". */
     fun plorer(host: String): Part {
-        val asked = minOf(MAX, PLORER_MAX)
+        val asked = minOf(historyLimit, PLORER_MAX)
         val arr = JSONArray(http("https://$host/getAddressTransactions/$a?apiKey=freekey&limit=$asked"))
         val oldest = (0 until arr.length()).map { arr.getJSONObject(it).optLong("timestamp") }.filter { it > 0 }.minOrNull()?.times(1000) ?: 0L
         val items = (0 until arr.length()).mapNotNull { i ->
@@ -480,7 +473,7 @@ internal fun evmNativePage(name: String, chainId: Long, blockscout: String?, rou
     if (etherscanKey.isNotBlank()) {
         val j = runCatching {
             JSONObject(http("https://api.etherscan.io/v2/api?chainid=$chainId&module=account&action=txlist" +
-                "&address=$a&page=1&offset=$MAX&sort=desc&apikey=${URLEncoder.encode(etherscanKey, "UTF-8")}"))
+                "&address=$a&page=1&offset=$historyLimit&sort=desc&apikey=${URLEncoder.encode(etherscanKey, "UTF-8")}"))
         }.getOrNull()
         if (j != null) {
             if (j.optString("status") == "1") return etherscanPage(j)
@@ -493,7 +486,7 @@ internal fun evmNativePage(name: String, chainId: Long, blockscout: String?, rou
     }
     return when {
         routescan -> etherscanStyle("https://api.routescan.io/v2/network/mainnet/evm/$chainId/etherscan/api?module=account" +
-            "&action=txlist&address=$a&page=1&offset=$MAX&sort=desc")
+            "&action=txlist&address=$a&page=1&offset=$historyLimit&sort=desc")
         blockscout != null -> {
             val j = JSONObject(http("https://$blockscout/api/v2/addresses/$a/transactions"))
             val arr = j.getJSONArray("items")

@@ -32,16 +32,22 @@ suspend fun releaseNotes(version: String): String? = withContext(Dispatchers.IO)
 }
 
 /**
- * True once per new version: the first launch after updating (not after a fresh install), so the app can show
- * what changed. [hasData]: you already had wallets saved (covers updating from a version that didn't record this).
+ * True after updating (not after a fresh install) until [markUpdateSeen], so the app can show what changed: if the
+ * notes can't be loaded (offline), it asks again next launch. [hasData]: you already had wallets saved (covers
+ * updating from a version that didn't record this).
  */
 fun justUpdated(context: Context, hasData: Boolean): Boolean {
     val prefs = context.getSharedPreferences("updates", Context.MODE_PRIVATE)
-    val current = BatApp.appVersion(context)
     val last = prefs.getString("seen", null)
-    if (last == current) return false
-    prefs.edit().putString("seen", current).apply()
-    return last != null || hasData
+    if (last == BatApp.appVersion(context)) return false
+    val updated = last != null || hasData
+    if (!updated) markUpdateSeen(context)
+    return updated
+}
+
+/** This version's "what's new" was shown. */
+fun markUpdateSeen(context: Context) {
+    context.getSharedPreferences("updates", Context.MODE_PRIVATE).edit().putString("seen", BatApp.appVersion(context)).apply()
 }
 
 /**

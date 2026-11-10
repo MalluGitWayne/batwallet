@@ -311,7 +311,11 @@ fun HistoryScreen(
                 }
                 if (fresh.isNotEmpty() && (reload to limit) == startedAt) {
                     val order = nets.toList()
-                    data = (data.orEmpty().filter { it.network != network } + fresh)
+                    val kept = fresh.map { n2 ->
+                        val old = data?.firstOrNull { it.network == n2.network }
+                        if (n2.error != null && old != null && old.items.isNotEmpty()) old.copy(error = n2.error) else n2
+                    }
+                    data = (data.orEmpty().filter { it.network != network } + kept)
                         .sortedBy { order.indexOf(it.network).let { i -> if (i < 0) Int.MAX_VALUE else i } }
                     data?.let { HistoryCache.save(address, it) }
                 }
@@ -340,7 +344,11 @@ fun HistoryScreen(
                             } catch (_: Exception) {
                                 emptyList()
                             }
-                            h.forEach { fresh[it.network] = it }
+                            // A network that failed keeps the transfers already shown, with the error (and Retry) on top.
+                            h.forEach { n2 ->
+                                val old = data?.firstOrNull { it.network == n2.network }
+                                fresh[n2.network] = if (n2.error != null && old != null && old.items.isNotEmpty()) old.copy(error = n2.error) else n2
+                            }
                             // Fresh networks replace their old copy; the rest stay until theirs arrive.
                             data = (data.orEmpty().filter { it.network !in fresh.keys } + fresh.values)
                                 .sortedBy { order.indexOf(it.network).let { i -> if (i < 0) Int.MAX_VALUE else i } }

@@ -76,7 +76,7 @@ object SelfUpdate {
             for (n in 1..5) {
                 withContext(Dispatchers.Main) { attempt = n; state = State.Downloading(0, 0) }
                 error = downloadAndInstall(app, url)
-                if (error == null || error == "Not a Batwallet release" || error.startsWith("This APK") ||
+                if (error == null || error.startsWith("Not a Batwallet") || error.startsWith("This APK") ||
                     error == "You already have this version" || error == "Not enough storage") break
             }
             withContext(Dispatchers.Main) { state = if (error == null) State.Installing else State.Failed(error) }

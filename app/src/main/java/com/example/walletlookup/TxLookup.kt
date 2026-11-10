@@ -196,7 +196,6 @@ private fun aptosName(name: String): String {
     return "0x" + aptosAddr(addr).ifEmpty { "0" } + "::" + name.substringAfter("::")
 }
 
-private const val APT_COIN = "0x1::aptos_coin::AptosCoin"
 
 /** Decimals of a token from one of its on-chain resources (null when they can't be read). */
 private fun aptosDecimals(account: String, resource: String): Int? = runCatching {
@@ -261,14 +260,15 @@ private fun tronTx(h: String): TxInfo? {
     }
     val time = info.optLong("blockTimeStamp").takeIf { it > 0 } ?: tx.optJSONObject("raw_data")?.optLong("timestamp") ?: 0L
     val logs = info.optJSONArray("log") ?: JSONArray()
-    for (i in 0 until logs.length()) {
-        val l = logs.getJSONObject(i)
-        val topics = l.optJSONArray("topics") ?: continue
-        if (topics.length() != 3 || topics.getString(0) != TRANSFER) continue
+    val transfers = (0 until logs.length()).map { logs.getJSONObject(it) }
+        .filter { l -> l.optJSONArray("topics")?.let { it.length() == 3 && it.getString(0) == TRANSFER } == true }
+    // The USDT transfer if there is one; another token's amount is shown in its smallest units, not guessed as 6 decimals.
+    (transfers.firstOrNull { it.optString("address").lowercase() == TRON_USDT_HEX } ?: transfers.firstOrNull())?.let { l ->
+        val topics = l.getJSONArray("topics")
         val usdt = l.optString("address").lowercase() == TRON_USDT_HEX
         val from = tronBase58("41" + topics.getString(1).takeLast(40))
         val to = tronBase58("41" + topics.getString(2).takeLast(40))
-        return TxInfo("Tron", Transfer(true, amount(hexNum(l.optString("data")), 6), null, time, url, h, from, to,
+        return TxInfo("Tron", Transfer(true, amount(hexNum(l.optString("data")), if (usdt) 6 else 0), null, time, url, h, from, to,
             if (usdt) "USDT" else "Token"), status)
     }
     val v = tx.optJSONObject("raw_data")?.optJSONArray("contract")?.optJSONObject(0)?.optJSONObject("parameter")?.optJSONObject("value")
@@ -318,9 +318,11 @@ private fun tonTx(h: String): TxInfo? {
         val a = actions.getJSONObject(i)
         a.optJSONObject("JettonTransfer")?.let { j ->
             val jet = j.optJSONObject("jetton")
+            // Only the real USDT contract counts as USDT: scam jettons are named "USD₮" too (never its own name).
+            val usdt = jet?.optString("address")?.lowercase() == USDT_TON_RAW
             return TxInfo("TON", Transfer(true, amount(BigInteger(j.optString("amount", "0")), jet?.optInt("decimals", 9) ?: 9), null, time, url, h,
                 tonFriendly(j.optJSONObject("sender")?.optString("address")), tonFriendly(j.optJSONObject("recipient")?.optString("address")),
-                jet?.optString("symbol")?.replace("₮", "T") ?: "Token"), status)
+                if (usdt) "USDT" else "Token"), status)
         }
         a.optJSONObject("TonTransfer")?.let { t ->
             return TxInfo("TON", Transfer(true, amount(BigInteger.valueOf(t.optLong("amount")), 9), null, time, url, h,
@@ -341,13 +343,19 @@ private fun solanaTx(sig: String): TxInfo? {
     val url = "https://solscan.io/tx/$sig"
     val keys = r.getJSONObject("transaction").getJSONObject("message").optJSONArray("accountKeys") ?: JSONArray()
     fun key(i: Int) = keys.optJSONObject(i)?.optString("pubkey") ?: keys.optString(i)
-    // Token account → its owner wallet, so From/To show wallets rather than token accounts.
+    // Token account → its owner wallet (so From/To show wallets rather than token accounts), its mint and decimals
+    // (a plain "transfer" names neither).
     val owners = HashMap<String, String>()
+    val mints = HashMap<String, Pair<String, Int>>()
     listOf("preTokenBalances", "postTokenBalances").forEach { k ->
         meta?.optJSONArray(k)?.let { arr ->
             for (i in 0 until arr.length()) {
                 val b = arr.getJSONObject(i)
-                b.optString("owner").takeIf { it.isNotBlank() }?.let { owners[key(b.optInt("accountIndex"))] = it }
+                val account = key(b.optInt("accountIndex"))
+                b.optString("owner").takeIf { it.isNotBlank() }?.let { owners[account] = it }
+                b.optString("mint").takeIf { it.isNotBlank() }?.let { m ->
+                    mints[account] = m to (b.optJSONObject("uiTokenAmount")?.optInt("decimals", 6) ?: 6)
+                }
             }
         }
     }
@@ -356,10 +364,12 @@ private fun solanaTx(sig: String): TxInfo? {
         val parsed = ins.getJSONObject(i).optJSONObject("parsed") ?: continue
         val info = parsed.optJSONObject("info") ?: continue
         when (parsed.optString("type")) {
-            "transferChecked", "transfer" -> if (ins.getJSONObject(i).optString("program") == "spl-token") {
+            "transferChecked", "transfer" -> if (ins.getJSONObject(i).optString("program").startsWith("spl-token")) {
+                val known = mints[info.optString("source")] ?: mints[info.optString("destination")]
+                val mint = info.optString("mint").ifBlank { known?.first.orEmpty() }
                 val amt = info.optJSONObject("tokenAmount")?.optString("uiAmountString")?.let(::BigDecimal)
-                    ?: BigDecimal(info.optString("amount", "0")).movePointLeft(6)
-                val sym = SOL_STABLES[info.optString("mint")] ?: "Token"
+                    ?: BigDecimal(info.optString("amount", "0")).movePointLeft(known?.second ?: 6)
+                val sym = SOL_STABLES[mint] ?: "Token"
                 val from = info.optString("authority").ifBlank { owners[info.optString("source")] ?: info.optString("source") }
                 val to = owners[info.optString("destination")] ?: info.optString("destination")
                 return TxInfo("Solana", Transfer(true, amt, null, time, url, sig, from, to, sym), status)

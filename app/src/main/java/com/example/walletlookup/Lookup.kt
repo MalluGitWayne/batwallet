@@ -120,6 +120,7 @@ fun cleanAddress(raw: String): String {
         if (scheme in setOf("bitcoincash", "bchtest")) s = "bitcoincash:$s"
     }
     s = s.substringBefore('?')
+    if (s.startsWith("pay-0x")) s = s.removePrefix("pay-") // EIP-681: ethereum:pay-0x…
     if (s.startsWith("0x")) s = s.substringBefore('@').substringBefore('/')
     return s
 }
@@ -224,7 +225,18 @@ fun detect(raw: String): AddrType? {
     if (a.isEmpty()) return null
     val l = a.lowercase()
     if (l.startsWith("lnbc") || l.startsWith("lnurl") || l.startsWith("lightning:")) return AddrType.LIGHTNING
-    return ADDR_RULES.firstOrNull { it.regex.matches(if (it.lower) l else a) }?.type
+    return ruleFor(a)?.type
+}
+
+private fun ruleFor(a: String): AddrRule? {
+    val l = a.lowercase()
+    return ADDR_RULES.firstOrNull { it.regex.matches(if (it.lower) l else a) }
+}
+
+/** The address as the network's services expect it: lower case for the formats matched case-blind (bech32, cashaddr, NEAR names). */
+private fun apiAddress(raw: String): String {
+    val a = rawAddress(raw)
+    return if (ruleFor(a)?.lower == true) a.lowercase() else a
 }
 
 // ===================== Lookup =====================
@@ -236,7 +248,7 @@ suspend fun lookup(
     /** Check just these networks (null = all): the EVM networks, and Bitcoin Cash for a legacy Bitcoin address. */
     networks: Set<String>? = null,
 ): List<ChainResult> = coroutineScope {
-    val a = rawAddress(raw)
+    val a = apiAddress(raw)
     @Suppress("NAME_SHADOWING")
     val networks = netOf(raw)?.let { setOf(it) } ?: networks
     // Prices load at the same time as the balances, not before them: each network is built without prices and
@@ -486,7 +498,9 @@ private fun bch(a: String, p: Map<String, Double>): ChainResult {
 private fun blockcypher(name: String, coin: String, sym: String, gecko: String, a: String, p: Map<String, Double>): ChainResult {
     val j = JSONObject(http("https://api.blockcypher.com/v1/$coin/main/addrs/$a/balance"))
     val txs = j.getInt("final_n_tx")
-    return build(name, sym, gecko, amount(BigInteger.valueOf(j.getLong("final_balance")), 8), p,
+    // The confirmed balance, as the main source (esplora) counts it: otherwise a pending payment would come and go
+    // as the two sources take turns, and alert "received" then "sent".
+    return build(name, sym, gecko, amount(BigInteger.valueOf(j.getLong("balance")), 8), p,
         extra = listOf(
             "Total received" to "${fmt(amount(BigInteger.valueOf(j.getLong("total_received")), 8))} $sym",
             "Transactions" to txs.toString(),
@@ -585,7 +599,8 @@ internal fun solanaCall(method: String, params: JSONArray): JSONObject {
                 return r
             } catch (e: Exception) {
                 last = e
-                val limited = e.message.orEmpty().let { "429" in it || it.contains("too many", ignoreCase = true) }
+                // http() turns an HTTP 429 into "Rate limited by the API…"; a JSON-RPC refusal says 429 / too many.
+                val limited = e.message.orEmpty().let { "429" in it || it.contains("too many", ignoreCase = true) || it.startsWith("Rate limited") }
                 if (!limited || attempt == 1 || requestTimeLeft() < 2_000) break
                 Thread.sleep(700)
             }
@@ -622,6 +637,8 @@ private fun solana(a: String, p: Map<String, Double>): ChainResult {
 // ---------- TON (tonapi for the account, toncenter for USDT) ----------
 
 internal const val USDT_TON = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
+/** [USDT_TON] in the raw form tonapi gives ("0:" + hex), to tell real USDT from lookalike jettons named "USD₮". */
+internal const val USDT_TON_RAW = "0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe"
 
 private fun ton(a: String, p: Map<String, Double>): ChainResult {
     val enc = URLEncoder.encode(a, "UTF-8")
