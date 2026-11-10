@@ -254,42 +254,42 @@ suspend fun lookup(
     // Prices load at the same time as the balances, not before them: each network is built without prices and
     // priced at the end ([priced]), so a slow price service no longer holds up every balance request.
     val prices = async(Dispatchers.IO) { if (withPrices) prices() else emptyMap() }
-    fun job(name: String, block: suspend (Map<String, Double>) -> ChainResult) =
-        async(Dispatchers.IO) { safe(name) { block(emptyMap()) } }
+    fun job(name: String, block: suspend () -> ChainResult) =
+        async(Dispatchers.IO) { safe(name) { block() } }
 
     val jobs = when (type) {
-        AddrType.EVM -> EVM_CHAINS.filter { networks == null || it.name in networks }.map { c -> job(c.name) { evm(c, a, it) } } +
-            (if (networks == null || "VeChain" in networks) listOf(job("VeChain") { vechain(a, it) }) else emptyList())
+        AddrType.EVM -> EVM_CHAINS.filter { networks == null || it.name in networks }.map { c -> job(c.name) { evm(c, a) } } +
+            (if (networks == null || "VeChain" in networks) listOf(job("VeChain") { vechain(a) }) else emptyList())
         AddrType.BITCOIN -> buildList {
-            add(job("Bitcoin") { esplora("Bitcoin", "https://mempool.space/api", "BTC", "bitcoin", a, it) })
+            add(job("Bitcoin") { esplora("Bitcoin", "https://mempool.space/api", "BTC", "bitcoin", a) })
             // Legacy 1…/3… addresses also exist on Bitcoin Cash (unless [networks] leaves it out).
             if (!a.lowercase().startsWith("bc1") && (networks == null || "Bitcoin Cash" in networks)) {
-                add(job("Bitcoin Cash") { bch(a, it) })
+                add(job("Bitcoin Cash") { bch(a) })
             }
         }
-        AddrType.BITCOIN_CASH -> listOf(job("Bitcoin Cash") { bch(a, it) })
-        AddrType.LITECOIN -> listOf(job("Litecoin") { p ->
+        AddrType.BITCOIN_CASH -> listOf(job("Bitcoin Cash") { bch(a) })
+        AddrType.LITECOIN -> listOf(job("Litecoin") {
             // litecoinspace.org is sometimes slow; BlockCypher is the backup.
             runCatching {
-                esplora("Litecoin", "https://litecoinspace.org/api", "LTC", "litecoin", a, p)
-            }.getOrElse { blockcypher("Litecoin", "ltc", "LTC", "litecoin", a, p) }
+                esplora("Litecoin", "https://litecoinspace.org/api", "LTC", "litecoin", a)
+            }.getOrElse { blockcypher("Litecoin", "ltc", "LTC", "litecoin", a) }
         })
         AddrType.DOGECOIN -> listOf(job("Dogecoin") {
-            blockcypher("Dogecoin", "doge", "DOGE", "dogecoin", a, it)
+            blockcypher("Dogecoin", "doge", "DOGE", "dogecoin", a)
         })
-        AddrType.TRON -> listOf(job("Tron") { tron(a, it) })
-        AddrType.SOLANA -> listOf(job("Solana") { solana(a, it) })
-        AddrType.TON -> listOf(job("TON") { ton(a, it) })
-        AddrType.XRP -> listOf(job("XRP Ledger") { xrp(a, it) })
-        AddrType.APTOS -> listOf(job("Aptos") { aptos(a, it) })
-        AddrType.CARDANO -> listOf(job("Cardano") { cardano(a, it) })
-        AddrType.POLKADOT -> listOf(job("Polkadot") { polkadot(a, it) })
-        AddrType.COSMOS -> listOf(job("Cosmos Hub") { cosmos(a, it) })
-        AddrType.STELLAR -> listOf(job("Stellar") { stellar(a, it) })
-        AddrType.ALGORAND -> listOf(job("Algorand") { algorand(a, it) })
-        AddrType.NEAR -> listOf(job("NEAR") { near(a, it) })
-        AddrType.TEZOS -> listOf(job("Tezos") { tezos(a, it) })
-        AddrType.EOS -> listOf(job("EOS") { eos(a, it) })
+        AddrType.TRON -> listOf(job("Tron") { tron(a) })
+        AddrType.SOLANA -> listOf(job("Solana") { solana(a) })
+        AddrType.TON -> listOf(job("TON") { ton(a) })
+        AddrType.XRP -> listOf(job("XRP Ledger") { xrp(a) })
+        AddrType.APTOS -> listOf(job("Aptos") { aptos(a) })
+        AddrType.CARDANO -> listOf(job("Cardano") { cardano(a) })
+        AddrType.POLKADOT -> listOf(job("Polkadot") { polkadot(a) })
+        AddrType.COSMOS -> listOf(job("Cosmos Hub") { cosmos(a) })
+        AddrType.STELLAR -> listOf(job("Stellar") { stellar(a) })
+        AddrType.ALGORAND -> listOf(job("Algorand") { algorand(a) })
+        AddrType.NEAR -> listOf(job("NEAR") { near(a) })
+        AddrType.TEZOS -> listOf(job("Tezos") { tezos(a) })
+        AddrType.EOS -> listOf(job("EOS") { eos(a) })
         AddrType.BNB_BEACON -> listOf(job("BNB Beacon Chain") {
             ChainResult("BNB Beacon Chain", listOf("Status" to
                 "BNB Beacon Chain (BEP2) was shut down in 2024. Its balances can't be checked anymore."), active = false)
@@ -340,18 +340,17 @@ private fun build(
     sym: String,
     gecko: String,
     native: BigDecimal,
-    p: Map<String, Double>,
     stables: List<Pair<String, BigDecimal>> = emptyList(),
     extra: List<Pair<String, String>> = emptyList(),
     activity: Boolean = false,
 ): ChainResult {
     val stableSum = stables.fold(BigDecimal.ZERO) { s, x -> s + x.second }
-    val total = worth(stableSum, native, p[gecko])
+    val total = worth(stableSum, native, null) // priced later ([priced])
     val rows = mutableListOf("Total value" to money(total))
     stables.forEach { (label, v) ->
         if (v.signum() > 0 || label.startsWith("USDT")) rows += label to fmt2(v)
     }
-    rows += sym to "${fmt(native)} · ${usd(native, p[gecko])}"
+    rows += sym to "${fmt(native)} · ${usd(native, null)}"
     rows += extra
     return ChainResult(
         chain, rows,
@@ -409,7 +408,7 @@ internal val EVM_CHAINS = listOf(
         "https://etc.blockscout.com/address/", emptyList()),
 )
 
-private fun evm(c: EvmChain, a: String, p: Map<String, Double>): ChainResult {
+private fun evm(c: EvmChain, a: String): ChainResult {
     fun call(id: Int, method: String, params: JSONArray) =
         JSONObject().put("jsonrpc", "2.0").put("id", id).put("method", method).put("params", params)
 
@@ -440,7 +439,7 @@ private fun evm(c: EvmChain, a: String, p: Map<String, Double>): ChainResult {
             val nonce = hex(2)
             val native = amount(hex(1), 18)
             return build(
-                c.name, c.sym, c.gecko, native, p, stables,
+                c.name, c.sym, c.gecko, native, stables,
                 extra = listOf("Transactions sent" to nonce.toString()),
                 activity = nonce.signum() > 0,
             )
@@ -451,12 +450,12 @@ private fun evm(c: EvmChain, a: String, p: Map<String, Double>): ChainResult {
     throw lastError ?: IOException("No response")
 }
 
-private fun vechain(a: String, p: Map<String, Double>): ChainResult {
+private fun vechain(a: String): ChainResult {
     val j = JSONObject(http("https://mainnet.vechain.org/accounts/$a"))
     val vet = amount(BigInteger(j.getString("balance").removePrefix("0x").ifEmpty { "0" }, 16), 18)
     val vtho = amount(BigInteger(j.getString("energy").removePrefix("0x").ifEmpty { "0" }, 16), 18)
     return build(
-        "VeChain", "VET", "vechain", vet, p,
+        "VeChain", "VET", "vechain", vet,
         extra = listOf("VTHO (energy)" to fmt(vtho)),
         activity = vtho.signum() > 0,
     )
@@ -464,7 +463,7 @@ private fun vechain(a: String, p: Map<String, Double>): ChainResult {
 
 // ---------- Bitcoin / Litecoin (Esplora), Bitcoin Cash (Haskoin), Dogecoin (BlockCypher) ----------
 
-private fun esplora(name: String, base: String, sym: String, gecko: String, a: String, p: Map<String, Double>): ChainResult {
+private fun esplora(name: String, base: String, sym: String, gecko: String, a: String): ChainResult {
     val addr = if (a.startsWith("bc1", true) || a.startsWith("ltc1", true)) a.lowercase() else a
     val j = JSONObject(http("$base/address/$addr"))
     val c = j.getJSONObject("chain_stats")
@@ -479,15 +478,15 @@ private fun esplora(name: String, base: String, sym: String, gecko: String, a: S
         "Transactions" to txCount.toString(),
     )
     if (pending != 0L) extra += "Pending" to "${fmt(amount(BigInteger.valueOf(pending), 8))} $sym"
-    return build(name, sym, gecko, amount(BigInteger.valueOf(received - sent), 8), p,
+    return build(name, sym, gecko, amount(BigInteger.valueOf(received - sent), 8),
         extra = extra, activity = txCount > 0)
 }
 
-private fun bch(a: String, p: Map<String, Double>): ChainResult {
+private fun bch(a: String): ChainResult {
     val j = JSONObject(http("https://api.haskoin.com/bch/address/${URLEncoder.encode(a, "UTF-8")}/balance"))
     val bal = amount(BigInteger.valueOf(j.getLong("confirmed") + j.optLong("unconfirmed")), 8)
     val txs = j.optInt("txs")
-    return build("Bitcoin Cash", "BCH", "bitcoin-cash", bal, p,
+    return build("Bitcoin Cash", "BCH", "bitcoin-cash", bal,
         extra = listOf(
             "Total received" to "${fmt(amount(BigInteger.valueOf(j.optLong("received")), 8))} BCH",
             "Transactions" to txs.toString(),
@@ -495,12 +494,12 @@ private fun bch(a: String, p: Map<String, Double>): ChainResult {
         activity = txs > 0)
 }
 
-private fun blockcypher(name: String, coin: String, sym: String, gecko: String, a: String, p: Map<String, Double>): ChainResult {
+private fun blockcypher(name: String, coin: String, sym: String, gecko: String, a: String): ChainResult {
     val j = JSONObject(http("https://api.blockcypher.com/v1/$coin/main/addrs/$a/balance"))
     val txs = j.getInt("final_n_tx")
     // The confirmed balance, as the main source (esplora) counts it: otherwise a pending payment would come and go
     // as the two sources take turns, and alert "received" then "sent".
-    return build(name, sym, gecko, amount(BigInteger.valueOf(j.getLong("balance")), 8), p,
+    return build(name, sym, gecko, amount(BigInteger.valueOf(j.getLong("balance")), 8),
         extra = listOf(
             "Total received" to "${fmt(amount(BigInteger.valueOf(j.getLong("total_received")), 8))} $sym",
             "Transactions" to txs.toString(),
@@ -513,17 +512,17 @@ private fun blockcypher(name: String, coin: String, sym: String, gecko: String, 
 /** Tether's USDT contracts, used by balances, history, the freeze check and transaction lookup alike. */
 internal const val USDT_TRC20 = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
 
-private fun tron(a: String, p: Map<String, Double>): ChainResult {
+private fun tron(a: String): ChainResult {
     // TronGrid rate-limits quick bursts; publicnode's Tron node answers the same balances as a backup.
     // An answer without the "data" list is a failure (the backup node is asked); only an empty list means "not activated".
     val data = try {
         JSONObject(http("https://api.trongrid.io/v1/accounts/$a")).optJSONArray("data")
             ?: throw IOException("TronGrid sent no account data")
     } catch (e: Exception) {
-        return tronBackup(a, p)
+        return tronBackup(a)
     }
     if (data.length() == 0) {
-        return build("Tron", "TRX", "tron", BigDecimal.ZERO, p, listOf("USDT (TRC20)" to BigDecimal.ZERO),
+        return build("Tron", "TRX", "tron", BigDecimal.ZERO, listOf("USDT (TRC20)" to BigDecimal.ZERO),
             extra = listOf("Status" to "Not activated (no on-chain activity yet)"))
     }
     val acc = data.getJSONObject(0)
@@ -537,11 +536,11 @@ private fun tron(a: String, p: Map<String, Double>): ChainResult {
     val extra = mutableListOf<Pair<String, String>>()
     if (acc.has("create_time")) extra += "Created" to date(acc.getLong("create_time") / 1000)
     acc.optLong("latest_opration_time").takeIf { it > 0 }?.let { extra += "Last activity" to date(it / 1000) }
-    return build("Tron", "TRX", "tron", amount(BigInteger.valueOf(acc.optLong("balance")), 6), p,
+    return build("Tron", "TRX", "tron", amount(BigInteger.valueOf(acc.optLong("balance")), 6),
         listOf("USDT (TRC20)" to usdt), extra, activity = true)
 }
 
-private fun tronBackup(a: String, p: Map<String, Double>): ChainResult {
+private fun tronBackup(a: String): ChainResult {
     val node = "https://tron-rpc.publicnode.com/wallet"
     val acc = JSONObject(http("$node/getaccount", JSONObject().put("address", a).put("visible", true).toString()))
     // The node answers an unknown account with an empty {}; an "Error" or "code" in the answer is a failed request,
@@ -550,7 +549,7 @@ private fun tronBackup(a: String, p: Map<String, Double>): ChainResult {
         throw IOException("Tron node error: " + acc.optString("Error").ifEmpty { acc.optString("message", acc.optString("code")) })
     }
     if (acc.length() == 0) {
-        return build("Tron", "TRX", "tron", BigDecimal.ZERO, p, listOf("USDT (TRC20)" to BigDecimal.ZERO),
+        return build("Tron", "TRX", "tron", BigDecimal.ZERO, listOf("USDT (TRC20)" to BigDecimal.ZERO),
             extra = listOf("Status" to "Not activated (no on-chain activity yet)"))
     }
     if (!acc.has("address")) throw IOException("Unexpected answer from the Tron node")
@@ -567,7 +566,7 @@ private fun tronBackup(a: String, p: Map<String, Double>): ChainResult {
     val usdt = amount(if (word.isEmpty()) BigInteger.ZERO else BigInteger(word, 16), 6)
     val extra = mutableListOf<Pair<String, String>>()
     if (acc.has("create_time")) extra += "Created" to date(acc.getLong("create_time") / 1000)
-    return build("Tron", "TRX", "tron", amount(BigInteger.valueOf(acc.optLong("balance")), 6), p,
+    return build("Tron", "TRX", "tron", amount(BigInteger.valueOf(acc.optLong("balance")), 6),
         listOf("USDT (TRC20)" to usdt), extra, activity = true)
 }
 
@@ -617,7 +616,7 @@ internal fun solanaMaybePruned(method: String, params: JSONArray, r: JSONObject)
     else -> false
 }
 
-private fun solana(a: String, p: Map<String, Double>): ChainResult {
+private fun solana(a: String): ChainResult {
     val lamports = solanaCall("getBalance", JSONArray().put(a)).getJSONObject("result").getLong("value")
     // A failed token read fails the whole Solana lookup (the last good balances stay), never reads as 0 USDT.
     val tokens = solanaTokenAccounts(a, SOL_STABLES.keys)
@@ -629,7 +628,7 @@ private fun solana(a: String, p: Map<String, Double>): ChainResult {
     sigs?.takeIf { it.length() > 0 }?.getJSONObject(0)?.optLong("blockTime")?.takeIf { it > 0 }?.let {
         extra += "Last activity" to date(it)
     }
-    return build("Solana", "SOL", "solana", amount(BigInteger.valueOf(lamports), 9), p,
+    return build("Solana", "SOL", "solana", amount(BigInteger.valueOf(lamports), 9),
         listOf("USDT (Solana)" to token("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"),
             "USDC (Solana)" to token("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")),
         extra, activity = sigs != null && sigs.length() > 0)
@@ -640,7 +639,7 @@ internal const val USDT_TON = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
 /** [USDT_TON] in the raw form tonapi gives ("0:" + hex), to tell real USDT from lookalike jettons named "USD₮". */
 internal const val USDT_TON_RAW = "0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe"
 
-private fun ton(a: String, p: Map<String, Double>): ChainResult {
+private fun ton(a: String): ChainResult {
     val enc = URLEncoder.encode(a, "UTF-8")
     val acc = JSONObject(http("https://tonapi.io/v2/accounts/$enc"))
     val status = acc.optString("status", "unknown")
@@ -656,24 +655,24 @@ private fun ton(a: String, p: Map<String, Double>): ChainResult {
         else -> status.replaceFirstChar { it.uppercase() }
     })
     acc.optLong("last_activity").takeIf { it > 0 }?.let { extra += "Last activity" to date(it) }
-    return build("TON", "TON", "the-open-network", amount(BigInteger.valueOf(acc.optLong("balance")), 9), p, listOf("USDT (TON)" to usdt), extra, activity = status == "active")
+    return build("TON", "TON", "the-open-network", amount(BigInteger.valueOf(acc.optLong("balance")), 9), listOf("USDT (TON)" to usdt), extra, activity = status == "active")
 }
 
 // ---------- XRP Ledger ----------
 
-private fun xrp(a: String, p: Map<String, Double>): ChainResult {
+private fun xrp(a: String): ChainResult {
     val body = JSONObject().put("method", "account_info")
         .put("params", JSONArray().put(JSONObject().put("account", a).put("ledger_index", "validated")))
     val res = JSONObject(http("https://xrplcluster.com/", body.toString())).getJSONObject("result")
     if (res.optString("status") == "error") {
         if (res.optString("error") == "actNotFound") {
-            return build("XRP Ledger", "XRP", "ripple", BigDecimal.ZERO, p,
+            return build("XRP Ledger", "XRP", "ripple", BigDecimal.ZERO,
                 extra = listOf("Status" to "Not activated (no on-chain activity yet)"))
         }
         throw IOException(res.optString("error_message", res.optString("error")))
     }
     val d = res.getJSONObject("account_data")
-    return build("XRP Ledger", "XRP", "ripple", amount(BigInteger(d.getString("Balance")), 6), p,
+    return build("XRP Ledger", "XRP", "ripple", amount(BigInteger(d.getString("Balance")), 6),
         // Not "Transactions sent": accounts made since 2020 start their Sequence at the ledger number (tens of millions).
         extra = listOf("Account sequence" to d.optLong("Sequence").toString()), activity = true)
 }
@@ -683,7 +682,7 @@ private fun xrp(a: String, p: Map<String, Double>): ChainResult {
 internal const val APTOS_NODE = "https://fullnode.mainnet.aptoslabs.com/v1"
 internal const val USDT_APTOS = "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b"
 
-private fun aptos(raw: String, p: Map<String, Double>): ChainResult {
+private fun aptos(raw: String): ChainResult {
     val a = "0x" + raw.removePrefix("0x").lowercase().padStart(64, '0')
     fun view(fn: String, type: String, vararg args: String): BigInteger {
         val body = JSONObject().put("function", fn)
@@ -694,20 +693,20 @@ private fun aptos(raw: String, p: Map<String, Double>): ChainResult {
     val usdt = amount(view("0x1::primary_fungible_store::balance", "0x1::fungible_asset::Metadata", a, USDT_APTOS), 6)
     val apt = amount(view("0x1::coin::balance", "0x1::aptos_coin::AptosCoin", a), 8)
     val seq = runCatching { JSONObject(http("$APTOS_NODE/accounts/$a")).optString("sequence_number", "0") }.getOrDefault("0")
-    return build("Aptos", "APT", "aptos", apt, p,
+    return build("Aptos", "APT", "aptos", apt,
         listOf("USDT (Aptos)" to usdt), listOf("Transactions sent" to seq), activity = seq != "0")
 }
 
 // ---------- Cardano (Koios) ----------
 
-private fun cardano(a: String, p: Map<String, Double>): ChainResult {
+private fun cardano(a: String): ChainResult {
     val arr = JSONArray(http("https://api.koios.rest/api/v1/address_info",
         JSONObject().put("_addresses", JSONArray().put(a)).toString()))
     val o = if (arr.length() > 0) arr.getJSONObject(0) else null
     val ada = amount(BigInteger(o?.optString("balance")?.ifEmpty { "0" } ?: "0"), 6)
     val extra = mutableListOf<Pair<String, String>>()
     o?.optString("stake_address")?.takeIf { it.isNotBlank() && it != "null" }?.let { extra += "Stake address" to it.take(14) + "…" }
-    return build("Cardano", "ADA", "cardano", ada, p, extra = extra, activity = o != null)
+    return build("Cardano", "ADA", "cardano", ada, extra = extra, activity = o != null)
 }
 
 // ---------- Polkadot (Parity public Sidecar) ----------
@@ -716,7 +715,7 @@ private fun cardano(a: String, p: Map<String, Double>): ChainResult {
  * Since the 2025 migration most DOT balances live on Asset Hub, while some (older or staking accounts) are still on
  * the relay chain: both are asked and added up. Either one failing fails Polkadot, so a partial total never shows.
  */
-private fun polkadot(a: String, p: Map<String, Double>): ChainResult {
+private fun polkadot(a: String): ChainResult {
     fun balance(sidecar: String): Pair<BigInteger, BigInteger> {
         val j = JSONObject(http("$sidecar/accounts/$a/balance-info"))
         if (!j.has("free")) throw IOException("Polkadot: no balance in the answer")
@@ -728,19 +727,19 @@ private fun polkadot(a: String, p: Map<String, Double>): ChainResult {
     val (hubFree, hubReserved) = balance("https://polkadot-asset-hub-public-sidecar.parity-chains.parity.io")
     val reserved = relayReserved + hubReserved
     val extra = if (reserved.signum() > 0) listOf("Reserved / staked" to "${fmt(amount(reserved, 10))} DOT") else emptyList()
-    return build("Polkadot", "DOT", "polkadot", amount(relayFree + hubFree + reserved, 10), p, extra = extra)
+    return build("Polkadot", "DOT", "polkadot", amount(relayFree + hubFree + reserved, 10), extra = extra)
 }
 
 // ---------- Cosmos Hub (public LCD) ----------
 
-private fun cosmos(a: String, p: Map<String, Double>): ChainResult {
+private fun cosmos(a: String): ChainResult {
     val arr = JSONObject(http("https://cosmos-rest.publicnode.com/cosmos/bank/v1beta1/balances/$a")).getJSONArray("balances")
     var uatom = BigInteger.ZERO
     for (i in 0 until arr.length()) {
         val b = arr.getJSONObject(i)
         if (b.getString("denom") == "uatom") uatom = BigInteger(b.getString("amount"))
     }
-    return build("Cosmos Hub", "ATOM", "cosmos", amount(uatom, 6), p,
+    return build("Cosmos Hub", "ATOM", "cosmos", amount(uatom, 6),
         activity = arr.length() > 0)
 }
 
@@ -755,12 +754,12 @@ private val STELLAR_ISSUERS = mapOf(
 /** True for Circle's USDC or Tether's USDT on Stellar; false for any other asset, whatever its code. */
 internal fun isStellarStable(code: String, issuer: String): Boolean = STELLAR_ISSUERS[code] == issuer
 
-private fun stellar(a: String, p: Map<String, Double>): ChainResult {
+private fun stellar(a: String): ChainResult {
     val j = try {
         JSONObject(http("https://horizon.stellar.org/accounts/$a"))
     } catch (e: IOException) {
         if (e.message?.startsWith("HTTP 404") == true) {
-            return build("Stellar", "XLM", "stellar", BigDecimal.ZERO, p,
+            return build("Stellar", "XLM", "stellar", BigDecimal.ZERO,
                 extra = listOf("Status" to "Not activated (no on-chain activity yet)"))
         }
         throw e
@@ -776,12 +775,12 @@ private fun stellar(a: String, p: Map<String, Double>): ChainResult {
             stables += "${b.getString("asset_code")} (Stellar)" to BigDecimal(b.getString("balance"))
         }
     }
-    return build("Stellar", "XLM", "stellar", xlm, p, stables, activity = true)
+    return build("Stellar", "XLM", "stellar", xlm, stables, activity = true)
 }
 
 // ---------- Algorand (AlgoNode) ----------
 
-private fun algorand(a: String, p: Map<String, Double>): ChainResult {
+private fun algorand(a: String): ChainResult {
     val j = JSONObject(http("https://mainnet-api.algonode.cloud/v2/accounts/$a"))
     val assets = j.optJSONArray("assets") ?: JSONArray()
     fun asset(id: Long): BigDecimal {
@@ -791,12 +790,12 @@ private fun algorand(a: String, p: Map<String, Double>): ChainResult {
         }
         return BigDecimal.ZERO
     }
-    return build("Algorand", "ALGO", "algorand", amount(BigInteger.valueOf(j.optLong("amount")), 6), p, listOf("USDT (Algorand)" to asset(312769), "USDC (Algorand)" to asset(31566704)))
+    return build("Algorand", "ALGO", "algorand", amount(BigInteger.valueOf(j.optLong("amount")), 6), listOf("USDT (Algorand)" to asset(312769), "USDC (Algorand)" to asset(31566704)))
 }
 
 // ---------- NEAR (FastNEAR public RPC) ----------
 
-private fun near(a: String, p: Map<String, Double>): ChainResult {
+private fun near(a: String): ChainResult {
     val rpc = "https://free.rpc.fastnear.com"
     fun query(params: JSONObject) = JSONObject(http(rpc,
         JSONObject().put("jsonrpc", "2.0").put("id", 1).put("method", "query").put("params", params).toString()))
@@ -804,7 +803,7 @@ private fun near(a: String, p: Map<String, Double>): ChainResult {
     val err = acc.optJSONObject("error")
     if (err != null || acc.optJSONObject("result") == null) {
         if (acc.toString().contains("does not exist") || acc.toString().contains("UNKNOWN_ACCOUNT")) {
-            return build("NEAR", "NEAR", "near", BigDecimal.ZERO, p,
+            return build("NEAR", "NEAR", "near", BigDecimal.ZERO,
                 extra = listOf("Status" to "Account doesn't exist yet"))
         }
         throw IOException(err?.optString("message") ?: "NEAR RPC error")
@@ -824,12 +823,12 @@ private fun near(a: String, p: Map<String, Double>): ChainResult {
             amount(BigInteger(text), 6)
         }
     }
-    return build("NEAR", "NEAR", "near", nearBal, p, listOf("USDT (NEAR)" to usdt), activity = true)
+    return build("NEAR", "NEAR", "near", nearBal, listOf("USDT (NEAR)" to usdt), activity = true)
 }
 
 // ---------- Tezos (TzKT) ----------
 
-private fun tezos(a: String, p: Map<String, Double>): ChainResult {
+private fun tezos(a: String): ChainResult {
     val j = JSONObject(http("https://api.tzkt.io/v1/accounts/$a"))
     // An empty list is a real 0; a failed request fails the network instead of reading as 0 USDT.
     val usdt = run {
@@ -837,13 +836,13 @@ private fun tezos(a: String, p: Map<String, Double>): ChainResult {
         if (arr.length() > 0) amount(BigInteger(arr.getJSONObject(0).getString("balance")), 6) else BigDecimal.ZERO
     }
     val txs = j.optInt("numTransactions")
-    return build("Tezos", "XTZ", "tezos", amount(BigInteger.valueOf(j.optLong("balance")), 6), p,
+    return build("Tezos", "XTZ", "tezos", amount(BigInteger.valueOf(j.optLong("balance")), 6),
         listOf("USDT (Tezos)" to usdt), listOf("Transactions" to txs.toString()), activity = txs > 0)
 }
 
 // ---------- EOS (Greymass public API) ----------
 
-private fun eos(a: String, p: Map<String, Double>): ChainResult {
+private fun eos(a: String): ChainResult {
     // Read with the whole error body: [http] keeps only its first 150 characters, which can cut off the
     // "unknown key" text. Only that (no such account) means "no account"; any other error fails EOS.
     val (code, text) = request("https://eos.greymass.com/v1/chain/get_account", JSONObject().put("account_name", a).toString())
@@ -858,7 +857,7 @@ private fun eos(a: String, p: Map<String, Double>): ChainResult {
     val extra = j.optString("created").takeIf { it.isNotBlank() }?.let {
         listOf("Created" to date(Instant.parse(it + "Z").epochSecond))
     } ?: emptyList()
-    return build("EOS", "EOS", "eos", bal, p, extra = extra, activity = true)
+    return build("EOS", "EOS", "eos", bal, extra = extra, activity = true)
 }
 
 /** An EOS node's error saying no account has this name (as opposed to the node itself failing). */

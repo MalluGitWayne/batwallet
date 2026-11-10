@@ -162,6 +162,7 @@ private const val STATE_CONFIG_CHANGE = "config_change"
 private const val STATE_SHARED = "shared"
 /** Back this soon from the app's own PIN screen and cancelling it there doesn't lock the app (it was just a cancel). */
 private const val AUTH_GRACE_MS = 60_000L
+private const val AUTH_GRACE_EVERY_TIME_MS = 15_000L
 
 // Batman palette: pure black (OLED) or white, a bat-signal gold accent, and a quiet slate card for the total.
 private val BatBlack = ComposeColor(0xFF000000)
@@ -378,7 +379,8 @@ class MainActivity : FragmentActivity() {
         // it after a long time locks (see confirm).
         val ownPrompt = stoppedInAuth && authInProgress
         val relock = (screenWentOff && canAuthenticate()) || (timedOut && !ownPrompt)
-        relockIfCancelled = timedOut && ownPrompt && away >= AUTH_GRACE_MS
+        // With "Every time" the grace is short: cancelling a PIN screen you left open for a while locks.
+        relockIfCancelled = timedOut && ownPrompt && away >= (if (lockTimeout == 0) AUTH_GRACE_EVERY_TIME_MS else AUTH_GRACE_MS)
         screenWentOff = false
         LockMemory.screenWentOff = false
         stoppedInAuth = false
@@ -610,6 +612,7 @@ private fun App(
     var syncing by remember { mutableStateOf(setOf<String>()) }
     var failed by remember { mutableStateOf(setOf<String>()) }
     var syncJob by remember { mutableStateOf<Job?>(null) }
+    var syncAgain by remember { mutableStateOf(false) }
     var safetyResult by remember { mutableStateOf<Safety?>(null) }
     var safetyLoading by remember { mutableStateOf(false) }
     // Why the safety check couldn't run at all (shown with a Retry button), and the Retry counter that re-runs it.
@@ -741,7 +744,9 @@ private fun App(
 
     /** Refresh every saved wallet, one at a time (gentle on the free APIs). */
     fun syncAll() {
-        if (syncJob?.isActive == true) return
+        // Asked while one is running (a backup imported, say): run once more after it, so wallets added meanwhile
+        // don't wait for the next refresh.
+        if (syncJob?.isActive == true) { syncAgain = true; return }
         // Your wallets first, then contacts (their balances are shown but never counted in your total).
         // Three at a time: much faster than one by one, still gentle on the free services.
         syncJob = scope.launch {
@@ -749,8 +754,15 @@ private fun App(
             suspend fun all(list: List<SavedAddress>) = kotlinx.coroutines.coroutineScope {
                 list.forEach { w -> launch { gate.acquire(); try { sync(w.address) } finally { gate.release() } } }
             }
-            all(saved.filter { !it.contact && !it.archived })
-            all(saved.filter { it.contact && !it.archived })
+            val done = HashSet<String>()
+            do {
+                syncAgain = false
+                // A second round only fetches the wallets the first one didn't have.
+                val now = saved.filter { !it.archived && it.address !in done }
+                all(now.filter { !it.contact })
+                all(now.filter { it.contact })
+                done += now.map { it.address }
+            } while (syncAgain)
         }
     }
 
@@ -1607,6 +1619,7 @@ private fun HomeTab(
                         Column(Modifier.weight(1f)) {
                             Text(
                                 savedWallet?.let(::walletLabel) ?: addressNames.labelFor(address, netOf(address)) ?: labelOf(address),
+                                translate = false,
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.SemiBold,
                             )
@@ -2123,6 +2136,7 @@ private fun WalletsTab(
                                     Spacer(Modifier.width(8.dp))
                                     Text(
                                         group.ifBlank { tr("Other") },
+                                        translate = false,
                                         style = MaterialTheme.typography.labelLarge,
                                         fontWeight = FontWeight.SemiBold,
                                         color = MaterialTheme.colorScheme.onSurface,
@@ -2191,7 +2205,7 @@ private fun WalletsTab(
                     OutlinedTextField(value = folder, onValueChange = { folder = it }, singleLine = true, label = { Text("Folder name") })
                     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         (groups + listOf("Binance", "Bybit", "OKX", "Trust Wallet")).distinct().forEach { g ->
-                            FilterChip(selected = folder == g, onClick = { folder = g }, label = { Text(g) })
+                            FilterChip(selected = folder == g, onClick = { folder = g }, label = { Text(g, translate = false) })
                         }
                         FilterChip(selected = false, onClick = { folder = "" }, label = { Text("No folder") })
                     }
@@ -2304,7 +2318,7 @@ private fun WalletRow(
         }
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
-            Text(item.name, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold,
+            Text(item.name, translate = false, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
                 (if (item.archived) tr("Archived") + " · " else "") + (if (item.pinned) tr("Pinned") + " · " else "") +
@@ -2454,7 +2468,7 @@ private fun ReceiveDialog(wallet: SavedAddress, onDismiss: () -> Unit) {
     val clipboard = LocalClipboardManager.current
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(wallet.name) },
+        title = { Text(wallet.name, translate = false) },
         text = {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
                 QrImage(rawAddress(wallet.address), Modifier.size(230.dp))
@@ -2518,7 +2532,7 @@ private fun WalletDialog(
                         )
                     Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         (groups + listOf("Binance", "Bybit", "OKX", "Trust Wallet", "MetaMask", "Coinbase", "Ledger")).distinct().forEach { g ->
-                            FilterChip(selected = group == g, onClick = { group = if (group == g) "" else g }, label = { Text(g) })
+                            FilterChip(selected = group == g, onClick = { group = if (group == g) "" else g }, label = { Text(g, translate = false) })
                         }
                     }
                 }

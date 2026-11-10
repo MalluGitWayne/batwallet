@@ -179,14 +179,17 @@ fun RecentTxSection(
                         DirectionIcon(t.symbol, t.incoming)
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            val other = t.counterparty?.let { names.labelFor(it, net) ?: knownPlatform(it) ?: (it.take(6) + "…" + it.takeLast(4)) }
-                            val twin = t.counterparty?.takeIf { names.labelFor(it, net) == null }?.let(::lookalikeOf)
+                            // Your name for the other side, looked up once for the row.
+                            val named = t.counterparty?.let { names.labelFor(it, net) }
+                            val unnamed = t.counterparty?.takeIf { named == null }
+                            val other = t.counterparty?.let { named ?: knownPlatform(it) ?: (it.take(6) + "…" + it.takeLast(4)) }
+                            val twin = unnamed?.let(::lookalikeOf)
                             if (twin != null) {
                                 Text(tr("Lookalike of") + " " + walletLabel(twin) + " · " + tr("don't copy"),
                                     style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold, color = OutRed)
                             }
                             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                                t.counterparty?.takeIf { names.labelFor(it, net) == null }?.let(::knownPlatform)?.let {
+                                unnamed?.let(::knownPlatform)?.let {
                                     ExchangeBadge(it, 16.dp)
                                     Spacer(Modifier.width(6.dp))
                                 }
@@ -200,7 +203,7 @@ fun RecentTxSection(
                             // Which of your wallets it was, then when. The time is never cut off: a long wallet name
                             // gives way first ("Broke sato… · Yesterday 21:09").
                             Row {
-                                Text(walletName(w) ?: net,
+                                Text(walletName(w) ?: net, translate = false,
                                     style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1,
                                     overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
                                 Text(" · " + (if (t.time > 0) shortDate(t.time / 1000) else tr("Pending")),

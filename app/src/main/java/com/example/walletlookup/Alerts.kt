@@ -273,7 +273,9 @@ object Alerts {
      */
     private val filling = Mutex()
     /** Per wallet: when its current payment notification started, its lines, and how many payments it covers. */
-    private val burst = java.util.concurrent.ConcurrentHashMap<String, Triple<Long, List<Pair<String, String>>, Int>>()
+    /** Payments to one wallet within 2 minutes: when the first came, the last 5 lines, how many, and whether one was big. */
+    private class Burst(val start: Long, val lines: List<Pair<String, String>>, val count: Int, val big: Boolean)
+    private val burst = java.util.concurrent.ConcurrentHashMap<String, Burst>()
     private val searchedAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
     /**
@@ -535,11 +537,13 @@ object Alerts {
                     else (matches[key] ?: coins[key]).let { m -> listOf(Seen(sym, net, diff, m?.time?.takeIf { it > 0 } ?: now, m?.hash, m?.from, m?.to)) }
                 }.filter { !exchange || it.amount.signum() > 0 }
 
-                // Respect the "only alert above" setting; small coin moves (gas fees) are skipped when a minimum is set.
+                // Respect the "only alert above" setting. Coins count by their value in USDT (3 ETH passes a 10 USDT
+                // minimum, a gas-sized move doesn't); a coin with no known price is skipped when a minimum is set.
                 val min = BigDecimal(store.alertMin)
                 val worth = changes.filter { (key, diff) ->
-                    key !in fees && (!exchange || diff.signum() > 0) && !isCoinDust(diff, key.substringBefore("|")) &&
-                        (if (key.substringBefore("|") in ALERT_STABLES) diff.abs() >= min else min.signum() == 0)
+                    val sym = key.substringBefore("|")
+                    key !in fees && (!exchange || diff.signum() > 0) && !isCoinDust(diff, sym) &&
+                        (min.signum() == 0 || (if (sym in ALERT_STABLES) diff.abs() else transferUsd(diff.abs(), sym))?.let { it >= min } == true)
                 }
 
                 // A tiny coin change next to a real payment (a fee, or dust) is left out.
@@ -560,7 +564,10 @@ object Alerts {
                 }
                 // Payments at or above the "big payment" amount use a louder channel and say so.
                 val bigMin = store.bigPayment
-                val big = bigMin > 0 && worth.any { (k, d) -> k.substringBefore("|") in ALERT_STABLES && d.abs() >= BigDecimal(bigMin) }
+                val big = bigMin > 0 && worth.any { (k, d) ->
+                    val sym = k.substringBefore("|")
+                    (if (sym in ALERT_STABLES) d.abs() else transferUsd(d.abs(), sym))?.let { it >= BigDecimal(bigMin) } == true
+                }
 
                 // Log the payment, then remember the new balances, then notify, without being cut off in between
                 // (all of it quick work on the phone, no network).
@@ -577,14 +584,16 @@ object Alerts {
                         else store.loadCache(w.address)?.totals?.usd?.let { tr("Balance") + " " + money(it) }
                     // Several payments to one wallet within 2 minutes: one notification, updated, instead of a stack.
                     val nowMs = System.currentTimeMillis()
-                    val earlier = burst[w.address]?.takeIf { nowMs - it.first < 120_000L }
-                    val all = (earlier?.second.orEmpty() + payments).takeLast(5)
-                    val count = (earlier?.third ?: 0) + payments.size
-                    val start = earlier?.first ?: nowMs
-                    burst[w.address] = Triple(start, all, count)
+                    val earlier = burst[w.address]?.takeIf { nowMs - it.start < 120_000L }
+                    val all = (earlier?.lines.orEmpty() + payments).takeLast(5)
+                    val count = (earlier?.count ?: 0) + payments.size
+                    val start = earlier?.start ?: nowMs
+                    // A small payment after a big one keeps the "Big payment" title (the sound is the new payment's own).
+                    val anyBig = big || earlier?.big == true
+                    burst[w.address] = Burst(start, all, count, anyBig)
                     // One payment:  "+700.00 USDT · Clean trust · Ton"  /  "USDT on TON · 23:30" + balance.
                     // Several:      "3 payments · Clean trust · BSC"   /  one line each + balance.
-                    val title = (if (big) tr("Big payment") + " · " else "") +
+                    val title = (if (anyBig) tr("Big payment") + " · " else "") +
                         (if (count == 1) all.single().first else "$count " + tr("payments")) + " · " + walletLabel(w)
                     val text = (if (count == 1) listOf(all.single().second) else all.map { (amount, details) -> "$amount · $details" }) +
                         listOfNotNull(balance)

@@ -385,7 +385,7 @@ fun HistoryScreen(
             Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onClose) { Text("← Back") }
                 Column(Modifier.weight(1f)) {
-                    Text(name ?: "Transaction history", style = MaterialTheme.typography.titleMedium,
+                    Text(name ?: "Transaction history", translate = name == null, style = MaterialTheme.typography.titleMedium,
                         maxLines = 1, overflow = TextOverflow.Ellipsis)
                     Text(short(rawAddress(address)) + " · " + labelOf(address),
                         style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -619,13 +619,14 @@ internal fun TransactionScreen(
     @Composable
     fun Party(label: String, addr: String?) {
         if (addr.isNullOrBlank()) return
-        val tag = names.labelFor(addr, network) ?: knownPlatform(addr)
+        val named = names.labelFor(addr, network)
+        val tag = named ?: knownPlatform(addr)
         Card(Modifier.fillMaxWidth().clickable { onOpenAddress(addr) }) {
             Column(Modifier.padding(14.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(tr(label) + (tag?.let { " · $it" } ?: ""), style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    knownPlatform(addr)?.takeIf { names.labelFor(addr, network) == null }?.let {
+                    knownPlatform(addr)?.takeIf { named == null }?.let {
                         Spacer(Modifier.width(6.dp))
                         ExchangeBadge(it, 16.dp)
                     }

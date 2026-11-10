@@ -39,8 +39,10 @@ fun Text(
     minLines: Int = 1,
     onTextLayout: ((TextLayoutResult) -> Unit)? = null,
     style: TextStyle = LocalTextStyle.current,
+    /** False for your own words (wallet, contact and folder names): a wallet named "Close" stays "Close". */
+    translate: Boolean = true,
 ) = androidx.compose.material3.Text(
-    text = tr(text), modifier = modifier, color = color, fontSize = fontSize, fontStyle = fontStyle, fontWeight = fontWeight,
+    text = if (translate) tr(text) else text, modifier = modifier, color = color, fontSize = fontSize, fontStyle = fontStyle, fontWeight = fontWeight,
     fontFamily = fontFamily, letterSpacing = letterSpacing, textDecoration = textDecoration, textAlign = textAlign,
     lineHeight = lineHeight, overflow = overflow, softWrap = softWrap, maxLines = maxLines, minLines = minLines,
     onTextLayout = onTextLayout, style = style,

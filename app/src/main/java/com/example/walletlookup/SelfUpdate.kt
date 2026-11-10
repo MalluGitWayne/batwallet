@@ -48,8 +48,9 @@ object SelfUpdate {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
+    /** The installer answered (showed its confirm screen): then you may take as long as you like there. */
+    @Volatile internal var installerAnswered = false
 
-    /** Starts downloading and installing [url]; does nothing while an update is already running. */
     /**
      * Android's "Update this app?" screen, waiting to be shown. The installer reports in the background, where newer
      * Android versions (OnePlus especially) don't let apps open screens, so the visible update dialog opens it.
@@ -73,6 +74,7 @@ object SelfUpdate {
             // Up to 5 tries: GitHub's download server can hang or drop on some mobile networks (a stalled try is
             // restarted after 20 seconds without data). Problems with the file itself aren't retried.
             var error: String? = null
+            installerAnswered = false
             for (n in 1..5) {
                 withContext(Dispatchers.Main) { attempt = n; state = State.Downloading(0, 0) }
                 error = downloadAndInstall(app, url)
@@ -84,7 +86,7 @@ object SelfUpdate {
             if (error == null) {
                 kotlinx.coroutines.delay(120_000)
                 withContext(Dispatchers.Main) {
-                    if (state is State.Installing) state = State.Failed("The installer didn't answer. Tap Update to try again.")
+                    if (state is State.Installing && !installerAnswered) state = State.Failed("The installer didn't answer. Tap Update to try again.")
                 }
             }
         }
@@ -241,6 +243,7 @@ class InstallReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE)) {
             PackageInstaller.STATUS_PENDING_USER_ACTION -> {
+                SelfUpdate.installerAnswered = true
                 val screen = if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent::class.java)
                 else @Suppress("DEPRECATION") intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)
                 // Handed to the visible update dialog to open (opening it from here is often blocked).

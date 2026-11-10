@@ -154,7 +154,9 @@ fun shareHistoryCsv(context: Context, name: String?, address: String, history: L
         }
     }
     val dir = File(context.cacheDir, "share").apply { mkdirs() }
-    val safeName = (name ?: rawAddress(address).take(10)).replace(Regex("[^A-Za-z0-9_-]"), "_")
+    // Letters of any script (a Russian or Hindi name stays readable), else the address's start.
+    val safeName = (name ?: "").replace(Regex("[^\\p{L}\\p{M}\\p{N}_-]+"), "_").trim('_').take(40)
+        .ifEmpty { rawAddress(address).take(10).replace(Regex("[^A-Za-z0-9_-]"), "_") }
     val file = File(dir, "history-$safeName.csv").apply { writeText(csv) }
     val uri = FileProvider.getUriForFile(context, context.packageName + ".files", file)
     val send = Intent(Intent.ACTION_SEND).setType("text/csv")
