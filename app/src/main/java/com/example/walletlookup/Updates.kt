@@ -8,7 +8,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 /** Where Batwallet lives on GitHub: updates come from its Releases, problem reports go to its Issues. */
-const val GITHUB_REPO = "Malluwayne/batwallet"
+const val GITHUB_REPO = "MalluGitWayne/batwallet"
 const val GITHUB_URL = "https://github.com/$GITHUB_REPO"
 
 /** The newest published version: its number, the APK to download, and the release page. */
