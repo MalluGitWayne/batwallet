@@ -348,9 +348,9 @@ private fun logWindow(c: EvmHist, a: String, time: Long, back: Long, token: Stri
         .getJSONObject("result").getString("timestamp").removePrefix("0x"), 16).toLong()
     // Which blocks: estimate the block rate from the latest block and one 10,000 back.
     val latest = BigInteger(JSONObject(node.post(call(1, "eth_blockNumber", JSONArray()).toString())).getString("result").removePrefix("0x"), 16).toLong()
-    val back = maxOf(0L, latest - 10_000)
+    val ref = maxOf(0L, latest - 10_000) // a block number; not the [back] look-back in millis
     val tLatest = blockTime(latest)
-    val perSec = (latest - back).toDouble() / maxOf(1L, tLatest - blockTime(back))
+    val perSec = (latest - ref).toDouble() / maxOf(1L, tLatest - blockTime(ref))
     fun blockAt(sec: Long) = (latest - ((tLatest - sec) * perSec).toLong()).coerceIn(0L, latest)
     val from = blockAt((time - back) / 1000)
     val to = blockAt(time / 1000 + 15 * 60)
@@ -1201,9 +1201,11 @@ internal fun activityCheck(hist: List<History>, active: Set<String> = emptySet()
             else -> unusedCheck()
         }
     }
-    val newest = all.maxOf { it.time }
+    // 0 when a node didn't give the time (pending, or the block-time lookup failed): don't say "1 Jan 1970".
+    val newest = all.maxOf { it.time }.takeIf { it > 0 }
     return Check(Level.GOOD, "Active wallet",
-        tr("%d recent transfers found, latest on %s.").replace("%d", all.size.toString()).replace("%s", date(newest / 1000)))
+        if (newest == null) tr("%d recent transfers found.").replace("%d", all.size.toString())
+        else tr("%d recent transfers found, latest on %s.").replace("%d", all.size.toString()).replace("%s", date(newest / 1000)))
 }
 
 private fun unusedCheck() = Check(Level.WARN, "No stablecoin transfers found",

@@ -25,6 +25,7 @@ import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequest
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -55,6 +56,7 @@ object Alerts {
     const val BIG_CHANNEL = "big_payments"
     const val SUMMARY_CHANNEL = "daily_summary"
     private const val DAILY = "daily-summary"
+    private const val DAILY_NEXT = "daily-summary-next"
     const val WATCH_CHANNEL = "watching"
     private const val PERIODIC = "balance-check"
     private const val NOW = "balance-check-now"
@@ -142,22 +144,31 @@ object Alerts {
     private fun applyDaily(context: Context, store: Store, force: Boolean) {
         val wm = WorkManager.getInstance(context)
         val prefs = context.getSharedPreferences("alerts", Context.MODE_PRIVATE)
+        // The old every-24-hours job drifted (DST, travel, late runs adding up); each run now books the next 9 AM.
+        wm.cancelUniqueWork(DAILY)
         if (!store.dailySummary) {
-            wm.cancelUniqueWork(DAILY)
+            wm.cancelUniqueWork(DAILY_NEXT)
             prefs.edit().putBoolean("daily_on", false).apply()
             return
         }
-        val retime = force || !prefs.getBoolean("daily_on", false)
+        val retime = force || !prefs.getBoolean("daily_on", false) || !prefs.getBoolean("daily_v2", false)
+        wm.enqueueUniqueWork(DAILY_NEXT, if (retime) ExistingWorkPolicy.REPLACE else ExistingWorkPolicy.KEEP, nextDaily())
+        prefs.edit().putBoolean("daily_on", true).putBoolean("daily_v2", true).apply()
+    }
+
+    /** The summary at the next 9 AM in the phone's current time zone. */
+    private fun nextDaily(): OneTimeWorkRequest {
         val now = java.time.ZonedDateTime.now()
         var next = now.withHour(9).withMinute(0).withSecond(0).withNano(0)
         if (!next.isAfter(now)) next = next.plusDays(1)
         val delay = java.time.Duration.between(now, next).toMillis()
-        val req = PeriodicWorkRequestBuilder<DailySummaryWorker>(24, TimeUnit.HOURS)
+        return OneTimeWorkRequestBuilder<DailySummaryWorker>()
             .setInitialDelay(delay, TimeUnit.MILLISECONDS).setConstraints(online).build()
-        wm.enqueueUniquePeriodicWork(
-            DAILY, if (retime) ExistingPeriodicWorkPolicy.CANCEL_AND_REENQUEUE else ExistingPeriodicWorkPolicy.KEEP, req,
-        )
-        prefs.edit().putBoolean("daily_on", true).apply()
+    }
+
+    /** Called by the summary when it ran: books tomorrow's (after this one finishes, so it doesn't cancel itself). */
+    internal fun scheduleNextDaily(context: Context) {
+        WorkManager.getInstance(context).enqueueUniqueWork(DAILY_NEXT, ExistingWorkPolicy.APPEND_OR_REPLACE, nextDaily())
     }
 
     /** Android's own page for the "Instant alerts running" notification, where it can be switched off. */
@@ -418,6 +429,7 @@ object Alerts {
         useAppLanguage(context, store)
         fiat = store.currency
         fiatRate = store.currencyRate
+        etherscanKey = store.etherscanKey // also when only the background runs (after a reboot)
         if (historyPrefs == null) historyPrefs = context.getSharedPreferences("history", Context.MODE_PRIVATE) // saved prices
 
         // Lighter checks: only the networks a wallet actually uses, with a full sweep every 10 minutes (also in
@@ -826,11 +838,18 @@ class BootReceiver : BroadcastReceiver() {
 class DailySummaryWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val store = Store(applicationContext)
+        try { return summary(store) } finally {
+            if (store.dailySummary) runCatching { Alerts.scheduleNextDaily(applicationContext) }
+        }
+    }
+
+    private suspend fun summary(store: Store): Result {
         if (!store.dailySummary || !Alerts.canNotify(applicationContext)) return Result.success()
         // In the app's language and currency, like the payment alerts.
         Alerts.useAppLanguage(applicationContext, store)
         fiat = store.currency
         fiatRate = store.currencyRate
+        etherscanKey = store.etherscanKey // also when only the background runs (after a reboot)
         val mine = store.loadAddresses().filter { !it.contact && !it.archived && !it.onExchange }
         val results = mine.flatMap { store.loadCache(it.address)?.results.orEmpty() }
         if (results.isEmpty()) return Result.success()

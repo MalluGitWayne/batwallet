@@ -182,6 +182,21 @@ private fun evmTxAt(c: EvmChain, url: String, h: String): TxInfo? {
         return TxInfo(c.name, Transfer(true, amount(hexNum(l.optString("data")), token.decimals), null, time, txUrl, h, from, to,
             token.symbol.substringBefore(" (")), status)
     }
+    // Another token: its amount in smallest units (as for Tron), not "0 ETH to the token contract".
+    for (i in 0 until logs.length()) {
+        val l = logs.getJSONObject(i)
+        val topics = l.optJSONArray("topics") ?: continue
+        if (topics.length() != 3 || topics.getString(0).removePrefix("0x") != TRANSFER) continue
+        return TxInfo(c.name, Transfer(true, amount(hexNum(l.optString("data")), 0), null, time, txUrl, h,
+            "0x" + topics.getString(1).takeLast(40), "0x" + topics.getString(2).takeLast(40), "Token"), status)
+    }
+    // No logs (failed or pending): a plain transfer(to, amount) call to a known stablecoin still says who and how much.
+    val input = tx.optString("input")
+    val called = c.tokens.firstOrNull { it.contract.equals(tx.optString("to"), ignoreCase = true) }
+    if (called != null && input.startsWith("0xa9059cbb") && input.length >= 138) {
+        return TxInfo(c.name, Transfer(true, amount(BigInteger(input.substring(74, 138), 16), called.decimals), null, time, txUrl, h,
+            tx.optString("from"), "0x" + input.substring(34, 74), called.symbol.substringBefore(" (")), status)
+    }
     return TxInfo(c.name, Transfer(true, amount(hexNum(tx.optString("value")), 18), null, time, txUrl, h,
         tx.optString("from"), tx.optString("to").takeIf { it.isNotBlank() && it != "null" }, c.sym), status)
 }
@@ -271,10 +286,20 @@ private fun tronTx(h: String): TxInfo? {
         return TxInfo("Tron", Transfer(true, amount(hexNum(l.optString("data")), if (usdt) 6 else 0), null, time, url, h, from, to,
             if (usdt) "USDT" else "Token"), status)
     }
-    val v = tx.optJSONObject("raw_data")?.optJSONArray("contract")?.optJSONObject(0)?.optJSONObject("parameter")?.optJSONObject("value")
+    val contract = tx.optJSONObject("raw_data")?.optJSONArray("contract")?.optJSONObject(0)
+    val v = contract?.optJSONObject("parameter")?.optJSONObject("value")
     val from = v?.optString("owner_address")?.takeIf { it.isNotBlank() }?.let(::tronBase58)
-    val to = v?.optString("to_address")?.takeIf { it.isNotBlank() }?.let(::tronBase58)
-    return TxInfo("Tron", Transfer(true, amount(BigInteger.valueOf(v?.optLong("amount") ?: 0L), 6), null, time, url, h, from, to, "TRX"), status)
+    fun addr(k: String) = v?.optString(k)?.takeIf { it.isNotBlank() }?.let(::tronBase58)
+    return when (contract?.optString("type")) {
+        // A TRC-10 token (the usual airdrop spam): its amount in smallest units, not as TRX.
+        "TransferAssetContract" -> TxInfo("Tron", Transfer(true, amount(BigInteger.valueOf(v?.optLong("amount") ?: 0L), 0), null, time, url, h,
+            from, addr("to_address"), "Token"), status)
+        // A contract call that sent TRX along.
+        "TriggerSmartContract" -> TxInfo("Tron", Transfer(true, amount(BigInteger.valueOf(v?.optLong("call_value") ?: 0L), 6), null, time, url, h,
+            from, addr("contract_address"), "TRX"), status)
+        else -> TxInfo("Tron", Transfer(true, amount(BigInteger.valueOf(v?.optLong("amount") ?: 0L), 6), null, time, url, h,
+            from, addr("to_address"), "TRX"), status)
+    }
 }
 
 /**
@@ -360,7 +385,20 @@ private fun solanaTx(sig: String): TxInfo? {
         }
     }
     val ins = r.getJSONObject("transaction").getJSONObject("message").optJSONArray("instructions") ?: JSONArray()
-    for (i in 0 until ins.length()) {
+    // A token transfer is the payment even after a small SOL tip or fee transfer (bots and aggregators add those
+    // first); a stablecoin before another token.
+    fun tokenMint(i: Int): String? {
+        val o = ins.getJSONObject(i)
+        if (!o.optString("program").startsWith("spl-token")) return null
+        val p = o.optJSONObject("parsed") ?: return null
+        if (p.optString("type") != "transfer" && p.optString("type") != "transferChecked") return null
+        val info = p.optJSONObject("info") ?: return null
+        return info.optString("mint").ifBlank { (mints[info.optString("source")] ?: mints[info.optString("destination")])?.first.orEmpty() }
+    }
+    val tokenAt = (0 until ins.length()).firstOrNull { tokenMint(it) in SOL_STABLES }
+        ?: (0 until ins.length()).firstOrNull { tokenMint(it) != null }
+    val order = listOfNotNull(tokenAt) + (0 until ins.length()).filter { it != tokenAt }
+    for (i in order) {
         val parsed = ins.getJSONObject(i).optJSONObject("parsed") ?: continue
         val info = parsed.optJSONObject("info") ?: continue
         when (parsed.optString("type")) {
@@ -368,7 +406,8 @@ private fun solanaTx(sig: String): TxInfo? {
                 val known = mints[info.optString("source")] ?: mints[info.optString("destination")]
                 val mint = info.optString("mint").ifBlank { known?.first.orEmpty() }
                 val amt = info.optJSONObject("tokenAmount")?.optString("uiAmountString")?.let(::BigDecimal)
-                    ?: BigDecimal(info.optString("amount", "0")).movePointLeft(known?.second ?: 6)
+                    // Decimals unknown: smallest units rather than a guess (USDT/USDC on Solana have 6).
+                    ?: BigDecimal(info.optString("amount", "0")).movePointLeft(known?.second ?: if (mint in SOL_STABLES) 6 else 0)
                 val sym = SOL_STABLES[mint] ?: "Token"
                 val from = info.optString("authority").ifBlank { owners[info.optString("source")] ?: info.optString("source") }
                 val to = owners[info.optString("destination")] ?: info.optString("destination")

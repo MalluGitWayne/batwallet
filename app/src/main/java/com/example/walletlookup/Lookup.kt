@@ -87,7 +87,8 @@ data class WalletTotals(val usdt: BigDecimal, val usd: BigDecimal?)
 
 /** A saved lookup result and when it was uetched (epoch millis). */
 data class Cached(val results: List<ChainResult>, val time: Long) {
-    val totals: WalletTotals get() = totalsOf(results)
+    // Worked out once: it's read for every row, sort comparison and header on each redraw. (Not part of equals.)
+    val totals: WalletTotals = totalsOf(results)
 }
 
 fun totalsOf(results: List<ChainResult>): WalletTotals = WalletTotals(
@@ -109,8 +110,11 @@ private val URI_RECIPIENT = Regex("[?&]address=([^&]+)")
 private val TON_RAW_ADDRESS = Regex("^-?\\d:[0-9a-fA-F]{64}$")
 private val URI_SCHEME = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:")
 
+private const val INVISIBLE = "\u200B\u200C\u200D\u2060\uFEFF"
+
 fun cleanAddress(raw: String): String {
-    var s = raw.trim().replace("\n", "").replace(" ", "")
+    // Any whitespace (CR/LF, tabs, …) and the invisible characters chats and web pages add (zero-width, BOM).
+    var s = raw.filterNot { it.isWhitespace() || it in INVISIBLE }
     // EIP-681 token transfer: ethereum:0xTOKEN@56/transfer?address=0xRECIPIENT&uint256=…
     URI_RECIPIENT.find(s)?.let { if (s.contains("/transfer")) return it.groupValues[1] }
     s = s.removePrefix("ton://transfer/")
@@ -202,6 +206,8 @@ private val ADDR_RULES = listOf(
     AddrRule("^ltc1[02-9ac-hj-np-z]{11,87}$", AddrType.LITECOIN, lower = true),
     AddrRule("^[LM]$B58{26,33}$", AddrType.LITECOIN),
     AddrRule("^D$B58{25,33}$", AddrType.DOGECOIN),
+    // Dogecoin multisig (P2SH): A… or 9…, 34 characters. Would otherwise be taken for Solana.
+    AddrRule("^[9A]$B58{33}$", AddrType.DOGECOIN),
     AddrRule("^T$B58{33}$", AddrType.TRON),
     AddrRule("^r$B58{24,34}$", AddrType.XRP),
     AddrRule("^addr1[02-9ac-hj-np-z]{50,120}$", AddrType.CARDANO, lower = true),
@@ -733,14 +739,26 @@ private fun polkadot(a: String): ChainResult {
 // ---------- Cosmos Hub (public LCD) ----------
 
 private fun cosmos(a: String): ChainResult {
-    val arr = JSONObject(http("https://cosmos-rest.publicnode.com/cosmos/bank/v1beta1/balances/$a")).getJSONArray("balances")
+    // Pages of 100 denoms in name order: "uatom" comes after any "factory/…" and "ibc/…" ones, so on a wallet full
+    // of airdropped tokens it can be on a later page.
     var uatom = BigInteger.ZERO
-    for (i in 0 until arr.length()) {
-        val b = arr.getJSONObject(i)
-        if (b.getString("denom") == "uatom") uatom = BigInteger(b.getString("amount"))
+    var any = false
+    var next: String? = null
+    for (page in 0 until 10) {
+        val url = "https://cosmos-rest.publicnode.com/cosmos/bank/v1beta1/balances/$a" +
+            (next?.let { "?pagination.key=" + java.net.URLEncoder.encode(it, "UTF-8") } ?: "")
+        val j = JSONObject(http(url))
+        val arr = j.getJSONArray("balances")
+        if (arr.length() > 0) any = true
+        for (i in 0 until arr.length()) {
+            val b = arr.getJSONObject(i)
+            if (b.getString("denom") == "uatom") uatom = BigInteger(b.getString("amount"))
+        }
+        if (uatom.signum() > 0) break
+        next = j.optJSONObject("pagination")?.optString("next_key")?.takeIf { it.isNotBlank() && it != "null" } ?: break
     }
     return build("Cosmos Hub", "ATOM", "cosmos", amount(uatom, 6),
-        activity = arr.length() > 0)
+        activity = any)
 }
 
 // ---------- Stellar (Horizon) ----------

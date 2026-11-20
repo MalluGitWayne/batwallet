@@ -79,7 +79,7 @@ object SelfUpdate {
                 withContext(Dispatchers.Main) { attempt = n; state = State.Downloading(0, 0) }
                 error = downloadAndInstall(app, url)
                 if (error == null || error.startsWith("Not a Batwallet") || error.startsWith("This APK") ||
-                    error == "You already have this version" || error == "Not enough storage") break
+                    error.startsWith(INSTALL_FAILED) || error == "You already have this version" || error == "Not enough storage") break
             }
             withContext(Dispatchers.Main) { state = if (error == null) State.Installing else State.Failed(error) }
             // The installer normally answers in seconds; if it never does, don't leave the dialog stuck.
@@ -175,11 +175,18 @@ object SelfUpdate {
                     val done = c.getLong(c.getColumnIndexOrThrow(android.app.DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
                     val total = c.getLong(c.getColumnIndexOrThrow(android.app.DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
                     withContext(Dispatchers.Main) { state = State.Downloading(maxOf(0L, done), total) }
-                    // No new data for 20 seconds: this try is stuck (it happens with GitHub's server on some
-                    // networks), so give it up and let the next try start fresh.
+                    // No new data for 20 seconds while running: this try is stuck (it happens with GitHub's server
+                    // on some networks), so give it up and let the next try start fresh. While Android's downloader
+                    // is paused (waiting to retry or for a network) it resumes by itself, often after more than
+                    // 20 seconds, so it gets longer before the partial file is thrown away.
                     val now = System.currentTimeMillis()
+                    val limit = when (status) {
+                        android.app.DownloadManager.STATUS_RUNNING -> 20_000L
+                        android.app.DownloadManager.STATUS_PAUSED, android.app.DownloadManager.STATUS_PENDING -> 180_000L
+                        else -> Long.MAX_VALUE
+                    }
                     if (done != lastBytes) { lastBytes = done; lastChange = now }
-                    else if (status != android.app.DownloadManager.STATUS_SUCCESSFUL && now - lastChange > 20_000) throw IOException("Download stalled")
+                    else if (now - lastChange > limit) throw IOException("Download stalled")
                     when (status) {
                         android.app.DownloadManager.STATUS_SUCCESSFUL -> return
                         android.app.DownloadManager.STATUS_FAILED -> {
@@ -224,6 +231,16 @@ object SelfUpdate {
             if (Build.VERSION.SDK_INT >= 31) setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
         }
         val id = installer.createSession(params)
+        // A failed write (no space, …) would leave the staged session behind, and downloading again won't help.
+        try { writeAndCommit(context, installer, id, file) } catch (e: Exception) {
+            runCatching { installer.abandonSession(id) }
+            throw IOException(INSTALL_FAILED + (e.message?.let { ": $it" } ?: ""), e)
+        }
+    }
+
+    private const val INSTALL_FAILED = "Install failed"
+
+    private fun writeAndCommit(context: Context, installer: PackageInstaller, id: Int, file: File) {
         installer.openSession(id).use { session ->
             session.openWrite("batwallet.apk", 0, file.length()).use { out ->
                 file.inputStream().use { it.copyTo(out) }

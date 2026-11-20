@@ -324,8 +324,11 @@ class Store(context: Context) {
 
     /** Forget everything stored about a deleted wallet (balances, alert baseline, payment log, saved history). */
     fun forget(address: String) {
-        prefs.edit().remove("cache:$address").remove("snap:$address").remove("activity:$address")
-            .remove("safety:" + address.lowercase()).apply()
+        // Under the payment log's lock, so a background check that is logging a payment can't write it back.
+        synchronized(ACTIVITY_LOCK) {
+            prefs.edit().remove("cache:$address").remove("snap:$address").remove("activity:$address")
+                .remove("safety:" + address.lowercase()).apply()
+        }
         runCatching {
             // The "history" file: saved transaction lists ("histcache:<address>") and node logs ("loghist:<chain>:<address>").
             val hist = appContext.getSharedPreferences("history", Context.MODE_PRIVATE)
@@ -435,6 +438,16 @@ class Store(context: Context) {
         val o = JSONObject(prefs.getString("snap:$address", null) ?: return null)
         o.keys().asSequence().associateWith { BigDecimal(o.getString(it)) }
     }.getOrNull()
+
+    /**
+     * Forgets the background checker's last balances for [addresses] (all when null), so its next check takes the
+     * current balances as the new starting point instead of alerting everything that arrived while it wasn't looking
+     * (alerts were off, or the wallet was archived).
+     */
+    fun clearSnapshots(addresses: Collection<String>? = null) = synchronized(ACTIVITY_LOCK) {
+        val keys = addresses?.map { "snap:$it" } ?: prefs.all.keys.filter { it.startsWith("snap:") }
+        if (keys.isNotEmpty()) prefs.edit().apply { keys.forEach { remove(it) } }.apply()
+    }
 
     fun saveSnapshot(address: String, snap: Map<String, BigDecimal>) {
         val o = JSONObject()

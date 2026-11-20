@@ -516,8 +516,11 @@ private fun NetworkBalance(r: ChainResult) {
                 Text(hideable(money(r.usd)), style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
             }
             Column(horizontalAlignment = Alignment.End) {
-                if (r.usdt.signum() > 0 || r.native.signum() == 0) {
+                if (r.usdt.signum() > 0 || (r.usdc.signum() == 0 && r.native.signum() == 0)) {
                     Text(hideable(fmt2(r.usdt)) + " USDT", style = MaterialTheme.typography.bodyMedium)
+                }
+                if (r.usdc.signum() > 0) {
+                    Text(hideable(fmt2(r.usdc)) + " USDC", style = MaterialTheme.typography.bodyMedium)
                 }
                 if (r.native.signum() > 0) {
                     Text(hideable(fmt(r.native)) + " " + r.nativeSym, style = MaterialTheme.typography.bodySmall,

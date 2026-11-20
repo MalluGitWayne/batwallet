@@ -99,6 +99,8 @@ jobs:
           # Release notes, shown by the app under "What's new": the tag's own message when it has one; else, for a
           # merged pull request, its description (minus the generated footer); else the commit's bullet list.
           NOTES=""
+          # The shallow checkout recreates a pushed tag as a lightweight one, losing its message: fetch the real tag.
+          git fetch --force --depth=1 origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
           if [ "$(git cat-file -t "$TAG" 2>/dev/null || true)" = "tag" ]; then
             NOTES=$(git tag -l --format='%(contents)' "$TAG" | sed -e '/^[[:space:]]*$/d' | head -c 10000 || true)
           fi

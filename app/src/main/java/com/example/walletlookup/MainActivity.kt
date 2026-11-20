@@ -331,8 +331,8 @@ class MainActivity : FragmentActivity() {
                         // Turning the lock off (or relaxing it) asks for the fingerprint first, so whoever holds the
                         // unlocked phone can't simply switch it off.
                         onLockChange = { on ->
-                            if (on) { lockEnabled = true; store.lockEnabled = true }
-                            else confirm("Turn off fingerprint lock") { lockEnabled = false; store.lockEnabled = false }
+                            if (on) { lockEnabled = true; store.lockEnabled = true; updateRecentsPreview() }
+                            else confirm("Turn off fingerprint lock") { lockEnabled = false; store.lockEnabled = false; updateRecentsPreview() }
                         },
                         lockTimeout = lockTimeout,
                         onLockTimeoutChange = { sec ->
@@ -391,7 +391,11 @@ class MainActivity : FragmentActivity() {
     override fun onResume() {
         super.onResume()
         if (locked && !authInProgress) authenticate()
-        // With the lock on, the Recents card shows no picture of the app (balances), like a banking app.
+        updateRecentsPreview()
+    }
+
+    /** With the lock on, the Recents card shows no picture of the app (balances), like a banking app. */
+    private fun updateRecentsPreview() {
         if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(!(lockEnabled && canAuthenticate()))
     }
 
@@ -621,6 +625,8 @@ private fun App(
     // Set by Retry: run the checks again even when the saved ones are recent.
     var safetyForce by remember { mutableStateOf(false) }
     var homeHistory by remember { mutableStateOf<List<History>?>(null) }
+    // The open address's transfers, newest first, for Home's recent list (worked out once per history).
+    val homeRecent = remember(homeHistory) { homeHistory.orEmpty().flatMap { h -> h.items.map { h.network to it } }.sortedByDescending { it.second.time } }
     var historyFor by remember { mutableStateOf<String?>(null) }
     var hidden by remember { mutableStateOf(store.hideBalances) }
     var scanning by remember { mutableStateOf(false) }
@@ -768,7 +774,7 @@ private fun App(
 
     fun updateSaved(list: List<SavedAddress>) {
         // Never the same address twice (two rows with one key crash the Wallets list).
-        val unique = list.distinctBy { it.address }
+        val unique = list.distinctBy { sameKey(it.address) }
         saved = unique
         store.saveAddresses(unique)
     }
@@ -936,18 +942,17 @@ private fun App(
     // While Batwallet is open, check for payments every 20 seconds whatever the alert mode, so they show up (and
     // notify) within seconds instead of after a pull-down. Only while it's on screen; background checks are the
     // alert mode's job. With alerts off it refreshes balances every minute instead.
-    LaunchedEffect(Unit) {
+    LaunchedEffect(lifecycle) {
         var rounds = 0
-        while (true) {
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) { while (true) {
             delay(20_000)
-            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) continue
             if (store.alertsEnabled) {
                 // In instant mode the service already checks every 30 seconds: no second loop on top of it.
                 if (!WatchService.running) runCatching { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { Alerts.checkWallets(context) } }
             } else if (++rounds % 3 == 0 && syncing.isEmpty()) {
                 syncAll()
             }
-        }
+        } }
     }
     // A payment came in (alerts recorded it): refresh every wallet's balance and Home's recent transactions,
     // not just that one wallet's balance. At most every 20 seconds, so a burst of payments is one refresh.
@@ -1207,7 +1212,7 @@ private fun App(
                     onHistory = { historyFor = address },
                     recentOf = { a ->
                         if (a != address) emptyList()
-                        else homeHistory.orEmpty().flatMap { h -> h.items.map { h.network to it } }.sortedByDescending { it.second.time }
+                        else homeRecent
                     },
                     onToggleHidden = toggleHidden,
                     onScan = { scanning = true },
@@ -1291,7 +1296,11 @@ private fun App(
                         walletSort = WalletSort.CUSTOM; store.walletSort = WalletSort.CUSTOM
                     },
                     onToggleHidden = toggleHidden,
-                    onArchive = { list, archive -> updateSaved(saved.map { if (it.address in list) it.copy(archived = archive) else it }) },
+                    onArchive = { list, archive ->
+                        // Un-archived: what arrived while archived isn't a new payment.
+                        if (!archive) store.clearSnapshots(list)
+                        updateSaved(saved.map { if (it.address in list) it.copy(archived = archive) else it })
+                    },
                     onBulkFolder = { list, folder ->
                         updateSaved(saved.map { if (it.address in list && !it.contact) it.copy(group = folder) else it })
                     },
@@ -1323,9 +1332,10 @@ private fun App(
                     onBackedUp = { lastBackup = it },
                     confirm = confirm,
                     onImport = { imported, json ->
-                        val known = saved.map { it.address }.toSet()
+                        val known = saved.map { sameKey(it.address) }.toSet()
                         // A file that lists an address twice must not save it twice (two rows with one key crash the list).
-                        val added = imported.filter { it.address !in known }.distinctBy { it.address }
+                        // 0x addresses ignore letter case: 0xAbC… from this phone and 0xabc… from the backup are one.
+                        val added = imported.filter { sameKey(it.address) !in known }.distinctBy { sameKey(it.address) }
                         updateSaved(saved + added)
                         // The backup's folder order: yours stays, folders only the backup knew are added after it.
                         groupOrder = store.importGroupOrder(json)
@@ -1333,6 +1343,7 @@ private fun App(
                         added.size
                     },
                     saved = saved,
+                    locked = locked,
                 )
             }
         }
@@ -2610,6 +2621,9 @@ private fun RadioRow(selected: Boolean, title: String, subtitle: String? = null,
 
 private val LOCK_TIMES = listOf(0 to "Every time", 60 to "1 min", 120 to "2 min", 180 to "3 min", 300 to "5 min")
 
+/** A saved address as a key for "same wallet?": 0x addresses ignore letter case, others don't. */
+internal fun sameKey(address: String): String = if (rawAddress(address).startsWith("0x")) address.lowercase() else address
+
 @Composable
 private fun SettingsTab(
     themeMode: ThemeMode,
@@ -2630,6 +2644,8 @@ private fun SettingsTab(
     /** The wallets read from a backup, and the backup's text (for its folder order). Returns how many were new. */
     onImport: (List<SavedAddress>, String) -> Int,
     saved: List<SavedAddress>,
+    /** True while the lock screen covers the app: no sheet or dialog may open over it. */
+    locked: Boolean = false,
 ) {
     val context = LocalContext.current
     var backupMessage by remember { mutableStateOf<String?>(null) }
@@ -2682,7 +2698,8 @@ private fun SettingsTab(
             return@rememberLauncherForActivityResult
         }
         backupMessage = try {
-            context.contentResolver.openOutputStream(uri)?.use { it.write(content.toByteArray()) }
+            (context.contentResolver.openOutputStream(uri) ?: throw java.io.IOException(tr("Couldn't open the file")))
+                .use { it.write(content.toByteArray()) }
             System.currentTimeMillis().let { store.lastBackup = it; onBackedUp(it) }
             tr("Backup saved") + " (${saved.size})."
         } catch (e: Exception) {
@@ -2726,6 +2743,8 @@ private fun SettingsTab(
     }
 
     fun setAlerts(on: Boolean) {
+        // Switched back on: start from today's balances, not the ones from before alerts were off.
+        if (on && !store.alertsEnabled) store.clearSnapshots()
         alerts = on
         store.alertsEnabled = on
         Alerts.apply(context)
@@ -2741,6 +2760,8 @@ private fun SettingsTab(
     }
 
     var open by rememberSaveable { mutableStateOf<String?>(null) }
+    // A section's sheet is a window: one restored while the app is locked would sit above the lock screen.
+    LaunchedEffect(locked) { if (locked) open = null }
     fun toggle(id: String) { open = if (open == id) null else id }
     // Arrived from Home's "Update available": open Updates straight away.
     LaunchedEffect(SelfUpdate.openInSettings) {
@@ -2906,17 +2927,18 @@ private fun SettingsTab(
                 dismissButton = { TextButton(onClick = { askExport = false }, enabled = !busy) { Text("Cancel") } },
             )
         }
-        lockedImport?.let { text ->
+        lockedImport?.takeIf { !locked }?.let { text ->
             var pw by remember { mutableStateOf("") }
-            var wrong by remember { mutableStateOf(false) }
+            // "Wrong password", or "damaged" for a file no password can open (cut off while copying, edited, …).
+            var wrong by remember { mutableStateOf<String?>(null) }
             var busy by remember { mutableStateOf(false) }
             var showPw by remember { mutableStateOf(false) }
             AlertDialog(
                 onDismissRequest = { if (!busy) lockedImport = null },
                 title = { Text("Backup password") },
                 text = {
-                    OutlinedTextField(value = pw, onValueChange = { pw = it; wrong = false }, singleLine = true, label = { Text("Password") },
-                        isError = wrong, supportingText = { if (wrong) Text("Wrong password") },
+                    OutlinedTextField(value = pw, onValueChange = { pw = it; wrong = null }, singleLine = true, label = { Text("Password") },
+                        isError = wrong != null, supportingText = { wrong?.let { Text(it) } },
                         visualTransformation = if (showPw) androidx.compose.ui.text.input.VisualTransformation.None
                             else androidx.compose.ui.text.input.PasswordVisualTransformation(),
                         trailingIcon = { TextButton(onClick = { showPw = !showPw }) { Text(if (showPw) "Hide" else "Show") } })
@@ -2925,11 +2947,13 @@ private fun SettingsTab(
                     TextButton(enabled = pw.isNotEmpty() && !busy, onClick = {
                         busy = true
                         scope.launch {
-                            val plain = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-                                runCatching { BackupCrypto.decrypt(text, pw) }.getOrNull()
+                            val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+                                runCatching { BackupCrypto.decrypt(text, pw) }
                             }
                             busy = false
-                            if (plain == null) wrong = true else { lockedImport = null; restore(plain) }
+                            val plain = result.getOrNull()
+                            if (plain != null) { lockedImport = null; restore(plain) }
+                            else wrong = if (result.exceptionOrNull() is BackupCrypto.DamagedException) "This backup file is damaged" else "Wrong password"
                         }
                     }) { Text(if (busy) "…" else "Open") }
                 },

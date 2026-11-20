@@ -413,3 +413,7 @@ Couldn't load history.	Не удалось загрузить историю.	�
 Camera not allowed	Доступ к камере запрещён	कैमरे की अनुमति नहीं है
 Open settings	Открыть настройки	सेटिंग्स खोलें
 Or import a photo of the QR code	Или загрузите фото QR-кода	या QR कोड की फ़ोटो इम्पोर्ट करें
+This backup file is damaged	Файл резервной копии повреждён	यह बैकअप फ़ाइल खराब है
+Install failed	Не удалось установить	इंस्टॉल नहीं हो सका
+%d recent transfers found.	Найдено недавних переводов: %d.	हाल के %d ट्रांसफ़र मिले।
+Couldn't open the file	Не удалось открыть файл	फ़ाइल नहीं खुल सकी

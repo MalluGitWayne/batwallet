@@ -62,11 +62,22 @@ object BackupCrypto {
     fun isEncrypted(text: String): Boolean =
         runCatching { JSONObject(text.trim()).optInt("encrypted") == 1 }.getOrDefault(false)
 
-    /** Throws when the password is wrong or the file was changed. */
+    /** The file itself is broken (cut off, edited, not a backup), so no password can open it. */
+    class DamagedException(cause: Throwable) : Exception("Damaged backup", cause)
+
+    /**
+     * Throws [javax.crypto.AEADBadTagException] when the password is wrong (or the encrypted part was changed),
+     * and [DamagedException] when the file can't be read at all, so a cut-off file isn't reported as a wrong password.
+     */
     fun decrypt(text: String, password: String): String {
-        val o = JSONObject(text.trim())
-        fun b(k: String) = Base64.decode(o.getString(k), Base64.NO_WRAP)
-        val rounds = roundsFor(o.optInt("rounds", 0))
-        return String(openBytes(b("data"), password, b("salt"), b("iv"), rounds), Charsets.UTF_8)
+        val parts = try {
+            val o = JSONObject(text.trim())
+            fun b(k: String) = Base64.decode(o.getString(k), Base64.NO_WRAP)
+            val salt = b("salt"); val iv = b("iv"); val data = b("data")
+            if (salt.isEmpty() || iv.isEmpty() || data.size < 16) throw IllegalArgumentException("too short")
+            Triple(data, salt, iv) to roundsFor(o.optInt("rounds", 0))
+        } catch (e: Exception) { throw DamagedException(e) }
+        val (data, salt, iv) = parts.first
+        return String(openBytes(data, password, salt, iv, parts.second), Charsets.UTF_8)
     }
 }
