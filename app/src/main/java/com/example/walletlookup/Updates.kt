@@ -2,6 +2,9 @@ package com.example.walletlookup
 
 import android.content.Context
 import android.os.Build
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -50,13 +53,21 @@ fun markUpdateSeen(context: Context) {
     context.getSharedPreferences("updates", Context.MODE_PRIVATE).edit().putString("seen", BatApp.appVersion(context)).apply()
 }
 
+/** The newer version found by the last check, as Compose state: Home's "Update available" line appears as soon as a check finds one. */
+object UpdateState {
+    var known by mutableStateOf<String?>(null)
+        internal set
+
+    fun load(context: Context) { known = knownUpdate(context) }
+}
+
 /**
- * The quiet weekly check: asks GitHub at most once every 7 days (a single small request) and remembers the newest
- * version, so Settings can say "16.x available" without you checking by hand.
+ * The quiet daily check: asks GitHub at most once a day (a single small request) and remembers the newest version,
+ * so Home and Settings say "21.x available" without you checking by hand.
  */
-suspend fun weeklyUpdateCheck(context: Context) {
+suspend fun dailyUpdateCheck(context: Context) {
     val prefs = context.getSharedPreferences("updates", Context.MODE_PRIVATE)
-    if (System.currentTimeMillis() - prefs.getLong("checked", 0) < 7 * 24 * 3600_000L) return
+    if (System.currentTimeMillis() - prefs.getLong("checked", 0) < 24 * 3600_000L) return
     val latest = latestRelease() ?: return
     rememberRelease(context, latest)
 }
@@ -64,6 +75,7 @@ suspend fun weeklyUpdateCheck(context: Context) {
 fun rememberRelease(context: Context, release: Release) {
     context.getSharedPreferences("updates", Context.MODE_PRIVATE).edit()
         .putLong("checked", System.currentTimeMillis()).putString("latest", release.version).apply()
+    UpdateState.known = knownUpdate(context)
 }
 
 /** The newer version found by the last check, or null when you're up to date. */

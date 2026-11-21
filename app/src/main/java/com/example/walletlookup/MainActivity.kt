@@ -293,7 +293,8 @@ class MainActivity : FragmentActivity() {
             }
             else -> lockEnabled && canAuthenticate()
         }
-        lifecycleScope.launch { runCatching { weeklyUpdateCheck(applicationContext) } }
+        UpdateState.load(applicationContext)
+        lifecycleScope.launch { runCatching { dailyUpdateCheck(applicationContext) } }
         SelfUpdate.cleanUp(this)
         etherscanKey = store.etherscanKey
         // Alerts can do nothing without the notification permission: if it was taken away, switch them off.
@@ -390,6 +391,8 @@ class MainActivity : FragmentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // The app can stay open for days: the update check (at most once a day) also runs on coming back to it.
+        lifecycleScope.launch { runCatching { dailyUpdateCheck(applicationContext) } }
         if (locked && !authInProgress) authenticate()
         updateRecentsPreview()
     }
@@ -1532,8 +1535,8 @@ private fun HomeTab(
     onOpenTx: (String, Transfer) -> Unit,
 ) {
     val context = LocalContext.current
-    // A newer version found by the weekly check (or in Settings), shown as one small line under the total.
-    val newer = remember(cache) { knownUpdate(context) }
+    // A newer version found by the daily check (or in Settings), shown as one small line under the total.
+    val newer = UpdateState.known
     val clipboard = LocalClipboardManager.current
     val savedWallet = saved.firstOrNull { it.address == address }
     val addressNames = remember(saved) { nameLabels(saved) }
@@ -1565,7 +1568,7 @@ private fun HomeTab(
                 }
             } else {
             item(key = "total") { TotalHeader(saved.filter { !it.contact && !it.archived && !it.onExchange }, cache, syncing, dayChange, onToggleHidden) }
-            // A newer version found by the weekly check (or by Settings): one small line, tap to update.
+            // A newer version found by the daily check (or by Settings): one small line, tap to update.
             if (newer != null) item(key = "updateBanner") { UpdateBanner(newer, onOpenUpdate) }
             if (backupDue != null) item(key = "backup") { BackupBanner(backupDue, onOpenBackup) }
             item(key = "actions") {
@@ -2754,6 +2757,8 @@ private fun SettingsTab(
         instant = on
         store.instantAlerts = on
         Alerts.apply(context)
+        // Without it the phone pauses Batwallet in the background and alerts come late, or only when it's opened.
+        if (on && !Alerts.ignoresBatteryLimits(context)) Alerts.askToIgnoreBatteryLimits(context)
     }
     val askPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         setAlerts(granted)
@@ -2820,6 +2825,15 @@ private fun SettingsTab(
                     color = if (instant && !batteryOk) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 4.dp, top = 2.dp, bottom = 6.dp),
                 )
+                // Whether background checks really run: if this is hours old while the app was closed, the phone is
+                // holding Batwallet back.
+                val last = remember(batteryOk, instant) { Alerts.lastCheck(context) }
+                if (last > 0) Text(
+                    tr("Last background check") + " " + ago(last),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp, bottom = 6.dp),
+                )
                 Label("Minimum")
                 ChipRow(listOf(0 to "Any amount", 1 to "1 USDT", 10 to "10 USDT", 100 to "100 USDT"), alertMin) { alertMin = it; store.alertMin = it }
                 Label("Big payment")
@@ -2829,6 +2843,23 @@ private fun SettingsTab(
                         Text("Allow background running")
                     }
                 }
+                // Many phones (OnePlus, Xiaomi, Oppo, Realme, Vivo, Samsung…) have their own battery manager that stops
+                // apps completely, which no app can get around: then alerts only come once Batwallet is opened again.
+                // Its switch ("Unrestricted", "Allow background activity", "Auto-launch") is on the app's info page.
+                TextButton(onClick = {
+                    runCatching {
+                        context.startActivity(Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.parse("package:${context.packageName}")))
+                    }
+                }, contentPadding = PaddingValues(0.dp)) {
+                    Text("Phone battery settings for Batwallet")
+                }
+                Text(
+                    "Alerts only when you open the app? Set Battery to \"Unrestricted\" (or allow background activity / auto-launch) there.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp, bottom = 6.dp),
+                )
             }
             SwitchRow("Daily summary", "9 AM", daily) { on ->
                 daily = on; store.dailySummary = on; runCatching { Alerts.apply(context) }

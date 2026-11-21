@@ -417,3 +417,6 @@ This backup file is damaged	Файл резервной копии повреж�
 Install failed	Не удалось установить	इंस्टॉल नहीं हो सका
 %d recent transfers found.	Найдено недавних переводов: %d.	हाल के %d ट्रांसफ़र मिले।
 Couldn't open the file	Не удалось открыть файл	फ़ाइल नहीं खुल सकी
+Last background check	Последняя фоновая проверка	आख़िरी बैकग्राउंड जाँच
+Phone battery settings for Batwallet	Настройки батареи для Batwallet	Batwallet के लिए फ़ोन की बैटरी सेटिंग
+Alerts only when you open the app? Set Battery to "Unrestricted" (or allow background activity / auto-launch) there.	Уведомления приходят, только когда вы открываете приложение? Выберите там для батареи «Без ограничений» (или разрешите фоновую работу / автозапуск).	अलर्ट तभी आते हैं जब आप ऐप खोलते हैं? वहाँ बैटरी को "Unrestricted" करें (या बैकग्राउंड गतिविधि / ऑटो-लॉन्च की अनुमति दें)।

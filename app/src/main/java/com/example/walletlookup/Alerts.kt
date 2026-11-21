@@ -130,6 +130,16 @@ object Alerts {
             ?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0) != 0
     }.getOrDefault(false)
 
+    /** When a background check (15-minute job, charging loop or instant mode) last ran; 0 if never. */
+    fun lastCheck(context: Context): Long =
+        context.getSharedPreferences("alerts", Context.MODE_PRIVATE).getLong("last_check", 0L)
+
+    /** A background check: what Settings shows as "Last checked" (the app's own checks while open don't count). */
+    suspend fun checkInBackground(context: Context) {
+        context.getSharedPreferences("alerts", Context.MODE_PRIVATE).edit().putLong("last_check", System.currentTimeMillis()).apply()
+        checkWallets(context)
+    }
+
     /** Run a check right away, e.g. to record starting balances for a newly added wallet. */
     fun checkNow(context: Context) {
         val req = OneTimeWorkRequestBuilder<BalanceWorker>().setConstraints(online).build()
@@ -708,7 +718,7 @@ class ChargingWorker(context: Context, params: WorkerParameters) : CoroutineWork
         val end = System.currentTimeMillis() + 4 * 60_000L
         var rounds = 0
         while (System.currentTimeMillis() < end && !isStopped && Alerts.pluggedIn(applicationContext)) {
-            runCatching { Alerts.checkWallets(applicationContext) }
+            runCatching { Alerts.checkInBackground(applicationContext) }
             rounds++
             delay(Alerts.INSTANT_INTERVAL_MS)
         }
@@ -729,7 +739,13 @@ class BalanceWorker(context: Context, params: WorkerParameters) : CoroutineWorke
         if (store.alertsEnabled && !store.instantAlerts && Alerts.pluggedIn(applicationContext)) {
             Alerts.scheduleCharging(applicationContext, ExistingWorkPolicy.KEEP)
         }
-        Alerts.checkWallets(applicationContext)
+        // Instant mode, but the phone stopped its service (memory, battery saver, a phone maker's "cleaner"): start it
+        // again from here instead of waiting until the app is opened. Android allows this when Batwallet may run in
+        // the background ("Allow background running"); otherwise it refuses and this check still runs.
+        if (store.alertsEnabled && store.instantAlerts && !WatchService.running) {
+            runCatching { ContextCompat.startForegroundService(applicationContext, Intent(applicationContext, WatchService::class.java)) }
+        }
+        Alerts.checkInBackground(applicationContext)
         return Result.success()
     }
 }
@@ -797,7 +813,7 @@ class WatchService : Service() {
                     // Instant: every 30 seconds. The wake lock is renewed each round (time-limited, so Android can
                     // always reclaim it) and keeps the checks on time while the screen is off.
                     wakeLock?.acquire(WAKE_MS)
-                    runCatching { Alerts.checkWallets(applicationContext) }
+                    runCatching { Alerts.checkInBackground(applicationContext) }
                     delay(Alerts.INSTANT_INTERVAL_MS)
                 }
             }
