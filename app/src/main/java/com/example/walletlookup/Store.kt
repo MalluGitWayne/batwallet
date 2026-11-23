@@ -326,7 +326,7 @@ class Store(context: Context) {
     fun forget(address: String) {
         // Under the payment log's lock, so a background check that is logging a payment can't write it back.
         synchronized(ACTIVITY_LOCK) {
-            prefs.edit().remove("cache:$address").remove("snap:$address").remove("activity:$address")
+            prefs.edit().remove("cache:$address").remove("snap:$address").remove("snapat:$address").remove("activity:$address")
                 .remove("safety:" + address.lowercase()).apply()
         }
         runCatching {
@@ -445,15 +445,22 @@ class Store(context: Context) {
      * (alerts were off, or the wallet was archived).
      */
     fun clearSnapshots(addresses: Collection<String>? = null) = synchronized(ACTIVITY_LOCK) {
-        val keys = addresses?.map { "snap:$it" } ?: prefs.all.keys.filter { it.startsWith("snap:") }
+        val keys = addresses?.flatMap { listOf("snap:$it", "snapat:$it") }
+            ?: prefs.all.keys.filter { it.startsWith("snap:") || it.startsWith("snapat:") }
         if (keys.isNotEmpty()) prefs.edit().apply { keys.forEach { remove(it) } }.apply()
     }
 
     fun saveSnapshot(address: String, snap: Map<String, BigDecimal>) {
         val o = JSONObject()
         snap.forEach { (k, v) -> o.put(k, v.toPlainString()) }
-        prefs.edit().putString("snap:$address", o.toString()).apply()
+        prefs.edit().putString("snap:$address", o.toString()).putLong("snapat:$address", System.currentTimeMillis()).apply()
     }
+
+    /**
+     * When [address]'s last balances were taken (0 if unknown): a change found now is everything that moved since
+     * then, which after a long gap (phone off, app stopped) is several payments, not one.
+     */
+    fun snapshotTime(address: String): Long = prefs.getLong("snapat:$address", 0L)
 }
 
 /** "Folder · Name" for a saved wallet (just the name when it has no folder). */

@@ -423,6 +423,84 @@ private fun solanaTransfer(a: String, sig: String): Transfer? {
 /** Ethplorer / Binplorer list at most 50 transactions per request with the free key. */
 private const val PLORER_MAX = 50
 
+/**
+ * Ethplorer / Binplorer requests, spaced out: the free key allows about 2 a second and answers 429 beyond that
+ * (two at once already trips it). Two retries, after longer pauses, when it does.
+ */
+private object PlorerGate {
+    private const val GAP_MS = 600L
+    private var last = 0L
+
+    fun get(url: String): String {
+        for (attempt in 0..2) {
+            synchronized(this) {
+                val wait = last + GAP_MS - System.currentTimeMillis()
+                if (wait > 0) Thread.sleep(wait)
+                last = System.currentTimeMillis()
+            }
+            val text = try { http(url) } catch (e: IOException) {
+                if (attempt < 2 && (e.message.orEmpty().contains("429") || e.message.orEmpty().contains("limit", true))) {
+                    Thread.sleep(1_500L * (attempt + 1)); continue
+                }
+                throw e
+            }
+            if (attempt < 2 && text.contains("\"code\":429")) { Thread.sleep(1_500L * (attempt + 1)); continue }
+            return text
+        }
+        throw IOException("HTTP 429 Rate limited")
+    }
+}
+
+/**
+ * BSC stablecoin transfers (USDT and USDC, the real contracts only: lookalike "USDC" spam tokens are left out) from
+ * Binplorer, one request for both, newest first. Much faster than scanning BSC's event logs, which at 2+ blocks a
+ * second need many slow node calls for even a few hours. [limit]: how many of the wallet's latest token transfers
+ * (of any token) to look through.
+ */
+internal fun bscStableTransfers(a: String, limit: Int = 100): Part {
+    val key = a.lowercase() + "|" + limit
+    val now = System.currentTimeMillis()
+    // The same answer for 20 seconds: a check's history and its search for a payment's details ask back to back.
+    bscStableCache[key]?.let { (t, p) -> if (now - t < 20_000) return p }
+    // Binplorer said "limit reached" a moment ago: don't ask again for a minute, the slower sources answer meanwhile.
+    if (now < plorerBlockedUntil) throw IOException("HTTP 429 Rate limited")
+    val part = try { bscStableTransfersUncached(a, limit) } catch (e: IOException) {
+        if (e.message.orEmpty().contains("429")) plorerBlockedUntil = System.currentTimeMillis() + 60_000
+        throw e
+    }
+    if (bscStableCache.size > 50) bscStableCache.clear()
+    bscStableCache[key] = System.currentTimeMillis() to part
+    return part
+}
+
+private val bscStableCache = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Part>>()
+@Volatile private var plorerBlockedUntil = 0L
+
+private fun bscStableTransfersUncached(a: String, limit: Int): Part {
+    val tokens = EVM_CHAINS.first { it.name == "BSC" }.tokens.associateBy { it.contract.lowercase() }
+    val text = PlorerGate.get("https://api.binplorer.com/getAddressHistory/$a?apiKey=freekey&type=transfer&limit=$limit")
+    val j = JSONObject(text)
+    j.optJSONObject("error")?.let { throw IOException("HTTP " + it.optString("code") + " " + it.optString("message")) }
+    val ops = j.optJSONArray("operations") ?: JSONArray()
+    val oldest = (0 until ops.length()).map { ops.getJSONObject(it).optLong("timestamp") }.filter { it > 0 }.minOrNull()?.times(1000) ?: 0L
+    val items = (0 until ops.length()).mapNotNull { i ->
+        val o = ops.getJSONObject(i)
+        val info = o.optJSONObject("tokenInfo") ?: return@mapNotNull null
+        val token = tokens[info.optString("address").lowercase()] ?: return@mapNotNull null
+        val v = o.optString("value").takeIf { it.isNotBlank() }?.let { runCatching { BigDecimal(it).toBigInteger() }.getOrNull() }
+            ?: return@mapNotNull null
+        if (v.signum() == 0) return@mapNotNull null
+        val from = o.optString("from")
+        val to = o.optString("to")
+        val incoming = to.equals(a, true)
+        val hash = o.optString("transactionHash")
+        Transfer(incoming, amount(v, token.decimals), if (incoming) from else to, o.optLong("timestamp") * 1000,
+            "https://bscscan.com/tx/$hash", hash, from, to, token.symbol.substringBefore(" ("))
+    }
+    // The list counts every token (spam too), so it's "full" when Binplorer gave as many as asked for.
+    return Part(items, ops.length() >= limit, if (ops.length() >= limit) oldest else 0L)
+}
+
 /** The same, with how far back the list is complete and whether Load more can get more (see [Part]). */
 internal fun evmNativePage(name: String, chainId: Long, blockscout: String?, routescan: Boolean, txBase: String, a: String): Part {
     val sym = mapOf("BSC" to "BNB", "Polygon" to "POL", "Avalanche" to "AVAX", "Celo" to "CELO", "Sonic" to "S")[name] ?: "ETH"
@@ -452,7 +530,7 @@ internal fun evmNativePage(name: String, chainId: Long, blockscout: String?, rou
     /** Ethplorer (Ethereum) / Binplorer (BSC): free with their public "freekey". */
     fun plorer(host: String): Part {
         val asked = minOf(historyLimit, PLORER_MAX)
-        val arr = JSONArray(http("https://$host/getAddressTransactions/$a?apiKey=freekey&limit=$asked"))
+        val arr = JSONArray(PlorerGate.get("https://$host/getAddressTransactions/$a?apiKey=freekey&limit=$asked"))
         val oldest = (0 until arr.length()).map { arr.getJSONObject(it).optLong("timestamp") }.filter { it > 0 }.minOrNull()?.times(1000) ?: 0L
         val items = (0 until arr.length()).mapNotNull { i ->
             val o = arr.getJSONObject(i)

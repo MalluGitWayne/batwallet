@@ -153,6 +153,16 @@ suspend fun findTransfers(raw: String, network: String, symbol: String, change: 
             if (near != null && pickTransfers(near, change, time).isNotEmpty()) return near
             return runCatching { scan(LATE_ALERT_MS) }.getOrNull() ?: near
         }
+        // BSC stablecoins: Binplorer lists the wallet's latest token transfers in one quick request. The log scan
+        // below (many slow node calls at BSC's block rate) is only for when it can't answer or doesn't have it yet.
+        if (evm && network == "BSC" && symbol.uppercase().startsWith("USD")) {
+            val quick = runCatching { bscStableTransfers(a).items }.getOrNull()
+                ?.filter { it.symbol.equals(symbol, true) && it.time in window }
+            if (quick != null) pickTransfers(quick, change, time).let { if (it.isNotEmpty()) return@withContext it }
+            // Binplorer runs about half a minute behind the chain: a payment from the last two minutes is simply not
+            // listed yet, and the next check finds it there. The slow log scan would only use up the check's time.
+            if (quick != null && System.currentTimeMillis() - time < 2 * 60_000L) return@withContext emptyList()
+        }
         val candidates: List<Transfer>? = when {
             evm && node != null && token != null ->
                 scanned { back -> logWindow(node, a, time, back, token.first, token.second, token.third) }
@@ -314,7 +324,7 @@ internal const val LATE_ALERT_MS = 24 * 3_600_000L
  * newest ones up to [time] whose amounts add up to it. Those only count from 3 hours before [time] to 15 minutes after
  * (and ones whose time isn't known), so an old transfer of the same amount is never taken for a new one.
  */
-fun pickTransfers(candidates: List<Transfer>, change: java.math.BigDecimal, time: Long): List<Transfer> {
+fun pickTransfers(candidates: List<Transfer>, change: java.math.BigDecimal, time: Long, since: Long = 0L): List<Transfer> {
     val incoming = change.signum() > 0
     val target = change.abs()
     val near = candidates.filter { it.time <= 0 || it.time in time - 3 * 3_600_000L..time + 15 * 60_000L }
@@ -327,6 +337,17 @@ fun pickTransfers(candidates: List<Transfer>, change: java.math.BigDecimal, time
             val fee = FEE_ALLOWANCE[t.symbol.uppercase()]
             !t.incoming && fee != null && t.amount.signum() > 0 && t.amount <= target && target - t.amount <= fee
         }.minWithOrNull(compareBy({ kotlin.math.abs(it.time - time) }, { target - it.amount }))?.let { return listOf(it) }
+    }
+    // The balances were last taken at [since]: everything that moved between then and now is the change. After a long
+    // gap (the phone stopped the app, or was off) that's several payments, which are then all found, each with its
+    // own details, instead of one "payment" of the difference that no transaction matches.
+    if (since > 0) {
+        val between = candidates.filter { it.time > since - 60_000L && it.time <= time + 5 * 60_000L }
+        val net = between.fold(java.math.BigDecimal.ZERO) { s, t -> s + if (t.incoming) t.amount else t.amount.negate() }
+        // Stablecoins: up to 5 cents apart, the hidden dust transfers ("address poisoning" spam under a cent, which
+        // BSC wallets get all the time) are in the balance but not in the list. Coins must add up exactly.
+        val slack = if (between.firstOrNull()?.symbol?.uppercase()?.startsWith("USD") == true) java.math.BigDecimal("0.05") else java.math.BigDecimal.ZERO
+        if (between.size > 1 && (net - change).abs() <= slack && net.signum() == change.signum()) return between.sortedByDescending { it.time }
     }
     var sum = java.math.BigDecimal.ZERO
     val picked = mutableListOf<Transfer>()
@@ -421,7 +442,9 @@ private suspend fun historyRaw(raw: String, networks0: Set<String>?): List<Histo
                 async(Dispatchers.IO) {
                     safeHistory(c.name) {
                         // Stablecoin transfers plus the network's own coin (ETH, BNB, …), newest first.
-                        val stable = evmHistory(c, a)
+                        // BSC: USDT and USDC from Binplorer (seconds); the event-log scan only when it can't answer.
+                        val stable = (if (c.name == "BSC") runCatching { bscStableTransfers(a) }.getOrNull() else null)
+                            ?: evmHistory(c, a)
                         val coin = runCatching { evmNativePage(c.name, c.chainId, c.blockscout, c.routescan, c.txBase, a) }.getOrNull()
                         historyOf(c.name, listOfNotNull(stable, coin))
                     }
@@ -579,8 +602,10 @@ private class LogNode(
     }
 }
 private val LOG_NODES = mapOf(
-    // BSC: 5,000 blocks per call. publicnode answers big batches cleanly (48.club rate-limits them), so it leads.
-    56L to LogNode("https://bsc-rpc.publicnode.com", 5_000, 12, listOf("https://rpc-bsc.48.club"), backupsFullRange = true),
+    // BSC: 5,000 blocks per call (the most either node allows). At 2+ blocks a second each call takes several
+    // seconds, so 4 calls per request: 12 took longer than the 20-second timeout and every scan failed. Binplorer
+    // (see bscStableTransfers) answers first; this is the fallback.
+    56L to LogNode("https://bsc-rpc.publicnode.com", 5_000, 4, listOf("https://rpc-bsc.48.club"), backupsFullRange = true),
     // Sonic: whole chain in a few calls; the backup only small windows (searching around one payment).
     146L to LogNode("https://rpc.soniclabs.com", 10_000_000, 10, listOf("https://sonic.drpc.org")),
     // Polygon: ~5.5 h per call. Backup takes the same requests.

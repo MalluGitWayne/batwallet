@@ -454,6 +454,8 @@ object Alerts {
             val used = if (full) null else store.loadCache(w.address)?.results
                 ?.filter { it.active && it.error == null }?.map { it.network }?.toSet()?.ifEmpty { null }
             val old = store.loadSnapshot(w.address)
+            // When those balances were taken: a change is everything since then (see pickTransfers).
+            val since = store.snapshotTime(w.address)
             val fresh = try {
                 // The starting balances cover every network: one missing there would later be taken in silently as
                 // "seen for the first time", and a payment on it never alerted.
@@ -508,7 +510,9 @@ object Alerts {
                 // changed are asked (without them, history looks up every network's balance first).
                 val recent = try {
                     withRequestBudget(STEP_BUDGET_MS) {
-                        history(w.address, changes.map { it.first.substringAfter("|") }.toSet(), limit = 10)
+                        // After a long gap there can be many transfers to account for, so look further back then.
+                        history(w.address, changes.map { it.first.substringAfter("|") }.toSet(),
+                            limit = if (since > 0 && now - since > 30 * 60_000L) 50 else 10)
                     }.orEmpty().flatMap { h -> h.items.map { h.network to it } }
                 } catch (e: CancellationException) {
                     throw e
@@ -525,7 +529,7 @@ object Alerts {
                 val parts = changes.filter { matches[it.first] == null }.associate { (key, diff) ->
                     val (sym, net) = key.split("|", limit = 2)
                     key to pickTransfers(recent.filter { (n, t) -> n == net && t.symbol.equals(sym, true) && (t.hash == null || t.hash !in taken) }
-                        .map { it.second }, diff, now).also { list -> list.forEach { t -> t.hash?.let { taken += it } } }
+                        .map { it.second }, diff, now, since).also { list -> list.forEach { t -> t.hash?.let { taken += it } } }
                 }.filterValues { it.isNotEmpty() }
                 // Coins (BNB, ETH, POL): not in transfer logs, so trace them now, while the node still has the balances.
                 val coins = changes.filter { (key, _) ->
@@ -577,12 +581,16 @@ object Alerts {
                 // Each payment as (amount, details): "+700.00 USDT" and "USDT on TON · 23:30" (coins also give the coin
                 // amount: "9.2636 TRX on Tron · 19:49"). Only the wallet's saved name is shown, never its address.
                 val clock = java.time.format.DateTimeFormatter.ofPattern("HH:mm").withZone(java.time.ZoneId.systemDefault())
-                val payments = shown.map { (key, diff) ->
+                val payments = shown.flatMap { (key, diff) ->
                     val (sym, net) = key.split("|", limit = 2)
                     val coin = !sym.uppercase().startsWith("USD")
-                    val at = matches[key]?.time?.takeIf { it > 0 } ?: now
-                    ((if (diff.signum() > 0) "+" else "−") + transferValue(diff.abs(), sym)) to
-                        ((if (coin) "${fmt(diff.abs())} $sym" else sym) + " " + tr("on") + " $net · " + clock.format(java.time.Instant.ofEpochMilli(at)))
+                    fun line(amount: BigDecimal, at: Long) =
+                        ((if (amount.signum() > 0) "+" else "−") + transferValue(amount.abs(), sym)) to
+                            ((if (coin) "${fmt(amount.abs())} $sym" else sym) + " " + tr("on") + " $net · " + clock.format(java.time.Instant.ofEpochMilli(at)))
+                    // Several payments found behind one change (after a gap): each one, not their difference.
+                    parts[key]?.filter { !exchange || it.incoming }?.takeIf { it.isNotEmpty() }
+                        ?.map { t -> line(if (t.incoming) t.amount else t.amount.negate(), t.time.takeIf { it > 0 } ?: now) }
+                        ?: listOf(line(diff, matches[key]?.time?.takeIf { it > 0 } ?: now))
                 }
                 // Payments at or above the "big payment" amount use a louder channel and say so.
                 val bigMin = store.bigPayment
