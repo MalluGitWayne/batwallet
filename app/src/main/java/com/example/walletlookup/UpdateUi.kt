@@ -167,7 +167,7 @@ fun UpdateBanner(version: String, onClick: () -> Unit) {
 @Composable
 fun WhatsNewDialog(version: String, notes: String, onDismiss: () -> Unit) {
     Dialog(onDismissRequest = onDismiss) {
-        Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surface, tonalElevation = 6.dp) {
+        Surface(shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceContainer) {
             Column(Modifier.padding(24.dp)) {
                 Text("What's new", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
                 Text(tr("Batwallet") + " " + version, style = MaterialTheme.typography.bodyMedium,

@@ -81,7 +81,11 @@ fun safetyKeysToDrop(times: Map<String, Long>, keep: Set<String>, limit: Int = 5
 private fun foldered(w: SavedAddress): SavedAddress =
     if (!w.contact && w.group.isBlank() && w.platform.isNotBlank()) w.copy(group = w.platform) else w
 
-enum class ThemeMode(val label: String) { SYSTEM("Follow phone (black or white)"), DARK("Black (OLED)"), LIGHT("White") }
+/**
+ * In the order the theme picker shows them. The saved names stay as they were: DARK has always meant black (OLED),
+ * so people who chose it keep black; DIM is the newer soft dark grey.
+ */
+enum class ThemeMode(val label: String) { SYSTEM("System"), DIM("Dark"), DARK("OLED"), LIGHT("Light") }
 
 /** Small on-device store for saved addresses and settings (nothing leaves the phone). */
 /**

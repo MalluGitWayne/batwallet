@@ -93,6 +93,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
@@ -195,36 +196,6 @@ private val BatType = Typography().run {
     )
 }
 
-private val DarkBat: ColorScheme = darkColorScheme(
-    primary = BatGold, onPrimary = BatGoldInk,
-    primaryContainer = ComposeColor(0xFF2E2819), onPrimaryContainer = ComposeColor(0xFFEBD6A8),
-    secondary = ComposeColor(0xFFF2F2F2), onSecondary = BatBlack,
-    tertiary = ComposeColor(0xFF7FD6C8),
-    background = BatBlack, onBackground = ComposeColor(0xFFEDEDED),
-    surface = BatBlack, onSurface = ComposeColor(0xFFEDEDED),
-    surfaceContainerLowest = BatBlack, surfaceContainerLow = ComposeColor(0xFF080808),
-    surfaceContainer = ComposeColor(0xFF0A0A0A), surfaceContainerHigh = ComposeColor(0xFF121212),
-    surfaceContainerHighest = ComposeColor(0xFF141414),
-    surfaceVariant = ComposeColor(0xFF1C1C1C), onSurfaceVariant = ComposeColor(0xFF9A9A9A),
-    secondaryContainer = ComposeColor(0xFF2E2819), onSecondaryContainer = ComposeColor(0xFFEBD6A8),
-    outline = ComposeColor(0xFF333333), outlineVariant = ComposeColor(0xFF222222),
-    error = ComposeColor(0xFFD9796F),
-)
-private val LightBat: ColorScheme = lightColorScheme(
-    primary = ComposeColor(0xFF8F5C00), onPrimary = ComposeColor.White,
-    primaryContainer = ComposeColor(0xFFF6EDDA), onPrimaryContainer = ComposeColor(0xFF4A3712),
-    secondary = ComposeColor(0xFF111111), onSecondary = ComposeColor.White,
-    tertiary = ComposeColor(0xFF007A6E),
-    background = ComposeColor.White, onBackground = ComposeColor(0xFF111111),
-    surface = ComposeColor.White, onSurface = ComposeColor(0xFF111111),
-    surfaceContainerLowest = ComposeColor.White, surfaceContainerLow = ComposeColor(0xFFFAFAFA),
-    surfaceContainer = ComposeColor(0xFFF5F5F5), surfaceContainerHigh = ComposeColor(0xFFF1F1F1),
-    surfaceContainerHighest = ComposeColor(0xFFEFEFEF),
-    surfaceVariant = ComposeColor(0xFFEBEBEB), onSurfaceVariant = ComposeColor(0xFF616161),
-    secondaryContainer = ComposeColor(0xFFF6EDDA), onSecondaryContainer = ComposeColor(0xFF4A3712),
-    error = ComposeColor(0xFFB3483D),
-)
-
 /**
  * The lock as the last screen in this app process left it. Android can rebuild the screen while the app is in the
  * background (dark mode, font size or language changed meanwhile); the rebuilt one carries on from here and the
@@ -308,18 +279,15 @@ class MainActivity : FragmentActivity() {
         }.isSuccess
 
         setContent {
-            val dark = when (themeMode) {
-                ThemeMode.DARK -> true
-                ThemeMode.LIGHT -> false
-                ThemeMode.SYSTEM -> isSystemInDarkTheme()
-            }
+            val palette = paletteFor(themeMode)
+            val dark = !palette.isLight
             DisposableEffect(dark) {
                 val bars = if (dark) SystemBarStyle.dark(Color.TRANSPARENT)
                 else SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
                 enableEdgeToEdge(statusBarStyle = bars, navigationBarStyle = bars)
                 onDispose {}
             }
-            MaterialTheme(colorScheme = if (dark) DarkBat else LightBat, typography = BatType) {
+            BatTheme(palette, BatType) {
                 // The app stays alive under the lock screen, so unlocking returns to the exact page you were on
                 // (a history, a transaction…) instead of starting again from Home.
                 Box(Modifier.fillMaxSize()) {
@@ -1130,19 +1098,26 @@ private fun App(
     Box(Modifier.fillMaxSize()) {
     Scaffold(
         bottomBar = {
-            NavigationBar {
+            // Plain bar, no tinted pill: the chosen tab's symbol and name in that tab's colour (Settings: plain text colour).
+            NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainerLow) {
+                @Composable fun itemColors(accent: TabAccent) = NavigationBarItemDefaults.colors(
+                    selectedIconColor = if (accent == TabAccent.Settings) MaterialTheme.colorScheme.onSurface else accent.color(),
+                    selectedTextColor = if (accent == TabAccent.Settings) MaterialTheme.colorScheme.onSurface else accent.color(),
+                    indicatorColor = ComposeColor.Transparent,
+                    unselectedIconColor = Muted, unselectedTextColor = Muted,
+                )
                 NavigationBarItem(selected = tab == TAB_HOME && !fromWallets, onClick = {
                     if (fromWallets) { fromWallets = false; address = ""; trail = emptyList() }
                     tab = TAB_HOME
                 },
-                    icon = { Icon(Icons.Filled.Home, contentDescription = null) }, label = { Text("Home") })
+                    icon = { Icon(Icons.Filled.Home, contentDescription = null) }, label = { Text("Home") }, colors = itemColors(TabAccent.Home))
                 NavigationBarItem(selected = tab == TAB_WALLETS || fromWallets, onClick = {
                     if (fromWallets) { fromWallets = false; address = ""; trail = emptyList() }
                     tab = TAB_WALLETS
                 },
-                    icon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null) }, label = { Text("Wallets") })
+                    icon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null) }, label = { Text("Wallets") }, colors = itemColors(TabAccent.Wallets))
                 NavigationBarItem(selected = tab == TAB_SETTINGS, onClick = { tab = TAB_SETTINGS },
-                    icon = { Icon(Icons.Filled.Settings, contentDescription = null) }, label = { Text("Settings") })
+                    icon = { Icon(Icons.Filled.Settings, contentDescription = null) }, label = { Text("Settings") }, colors = itemColors(TabAccent.Settings))
             }
         },
     ) { pad ->
@@ -1172,13 +1147,14 @@ private fun App(
             userScrollEnabled = address.isEmpty(),
             beyondViewportPageCount = 1,
         ) { page ->
+        // Each tab in its own colour (Home gold, Wallets blue, Settings grey): buttons, switches and chips follow it.
+        TabTheme(when (page) { 0 -> TabAccent.Home; 1, 2 -> TabAccent.Wallets; else -> TabAccent.Settings }) {
         Column(Modifier.fillMaxSize()) {
             if (page == 3) {
                 Text(
                     "Settings",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(start = 20.dp, top = 24.dp, bottom = 4.dp),
+                    style = MaterialTheme.typography.headlineMedium,
+                    modifier = Modifier.padding(start = 20.dp, top = 20.dp, bottom = 4.dp),
                 )
             }
             when (page) {
@@ -1350,6 +1326,7 @@ private fun App(
                 )
             }
         }
+        } // TabTheme
         }
     }
     // Full-screen pages (the scanner, a transaction, a history) are drawn over the tabs instead of replacing them, so
@@ -1762,19 +1739,21 @@ private fun TotalHeader(
     val sweepAlpha by animateFloatAsState(if (busy) 1f else 0f, tween(400), label = "sweep")
     val known = saved.mapNotNull { cache[it.address] }
     val usd = known.mapNotNull { it.totals.usd }.fold(BigDecimal.ZERO, BigDecimal::add)
-    // A quiet slate card: the total in white, today's change as a soft green or rose pill.
+    // A card like the others in the theme (no fixed dark block in Light): a small gold "Total" header, the total,
+    // and today's change as a green or red pill.
     Box(
-        Modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp))
-            .background(Brush.linearGradient(listOf(HeroStart, HeroEnd)))
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainer)
             .clickable(onClick = onToggleHidden),
     ) {
         Column(Modifier.padding(horizontal = 20.dp, vertical = 18.dp)) {
-            Text("Total", style = MaterialTheme.typography.labelLarge, color = ComposeColor.White.copy(alpha = 0.72f))
+            CardHeader(tr("Total"), Icons.Filled.Home, TabAccent.Home)
             Text(
                 if (saved.isEmpty()) money(BigDecimal.ZERO) else if (known.isEmpty()) "…" else hideable(money(usd)),
                 style = MaterialTheme.typography.displaySmall,
-                fontWeight = FontWeight.SemiBold,
-                color = ComposeColor.White,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.padding(top = 4.dp),
             )
             change?.takeIf { known.isNotEmpty() }?.let { ch ->
                 val up = ch.usd.signum() >= 0
@@ -1784,17 +1763,17 @@ private fun TotalHeader(
                     Text(
                         hideable("$sign${money(ch.usd.abs())} ($sign$pct%)"),
                         style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold,
-                        color = if (up) HeroUp else HeroDown,
-                        modifier = Modifier.clip(RoundedCornerShape(50)).background(ComposeColor.White.copy(alpha = 0.08f))
+                        color = if (up) UpGreen else DownRed,
+                        modifier = Modifier.clip(RoundedCornerShape(50)).background((if (up) UpGreen else DownRed).copy(alpha = 0.13f))
                             .padding(horizontal = 10.dp, vertical = 4.dp),
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text(tr("today"), style = MaterialTheme.typography.labelLarge, color = ComposeColor.White.copy(alpha = 0.72f))
+                    Text(tr("today"), style = MaterialTheme.typography.labelLarge, color = Muted)
                 }
             }
         }
         if (sweepAlpha > 0f) {
-            BatSweep(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(3.dp).alpha(sweepAlpha), color = BatGold)
+            BatSweep(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(3.dp).alpha(sweepAlpha), color = MaterialTheme.colorScheme.primary)
         }
     }
 }
@@ -2065,7 +2044,7 @@ private fun WalletsTab(
             // The box keeps the line's own 1dp height, so the 2dp light (centred on it) never moves the list below.
             Box(Modifier.fillMaxWidth().height(1.dp), contentAlignment = Alignment.Center) {
                 HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
-                if (sweepAlpha > 0f) BatSweep(Modifier.fillMaxWidth().requiredHeight(2.dp).alpha(sweepAlpha), color = BatGold)
+                if (sweepAlpha > 0f) BatSweep(Modifier.fillMaxWidth().requiredHeight(2.dp).alpha(sweepAlpha), color = MaterialTheme.colorScheme.primary)
             }
             if (current.searchable && !selecting) {
                 OutlinedTextField(
@@ -2775,10 +2754,10 @@ private fun SettingsTab(
     LaunchedEffect(openRequest) { openRequest?.let { open = it; onOpenHandled() } }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
+        // The theme first, as a segmented control: System / Dark / OLED / Light.
+        Spacer(Modifier.height(12.dp))
+        Segmented(ThemeMode.entries.map { tr(it.label) }, ThemeMode.entries.indexOf(themeMode)) { onThemeChange(ThemeMode.entries[it]) }
         SettingsSection("General") {
-        SettingGroup("Appearance", tr(themeMode.label), open == "theme", { toggle("theme") }) {
-            ThemeMode.entries.forEach { mode -> RadioRow(mode == themeMode, mode.label) { onThemeChange(mode) } }
-        }
         SettingGroup("Language", (LANGUAGES.firstOrNull { it.first == I18n.lang } ?: LANGUAGES.first()).second, open == "lang", { toggle("lang") }) {
             LANGUAGES.forEach { (code, label) ->
                 RadioRow(I18n.lang == code, label) { I18n.lang = code; store.language = code }
@@ -3116,8 +3095,8 @@ private fun SettingsSection(title: String, content: @Composable () -> Unit) {
         modifier = Modifier.padding(start = 6.dp, top = 22.dp, bottom = 8.dp))
     Card(
         Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainer),
     ) { Column(Modifier.padding(vertical = 4.dp)) { content() } }
 }
 
@@ -3129,30 +3108,21 @@ private fun SettingGroup(title: String, summary: String, expanded: Boolean, onTo
         Modifier.fillMaxWidth().clickable(onClick = onToggle).padding(horizontal = 16.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // Each row's icon in its own colour (as a phone's Settings does), on a light tint of the same colour.
+        // Each row's symbol in white on its own colour, as iPhone Settings does.
         val tint = when (title) {
-            "Appearance" -> ComposeColor(0xFF8B7CFF); "Language" -> ComposeColor(0xFF3B8BF6); "Currency" -> ComposeColor(0xFF2EBD85)
-            "Notifications" -> ComposeColor(0xFFF5A623); "Security" -> ComposeColor(0xFFF6465D); "Backup" -> ComposeColor(0xFF19B5A5)
-            "Etherscan API key" -> ComposeColor(0xFF6C8CFF); "Updates" -> MaterialTheme.colorScheme.primary
-            else -> ComposeColor(0xFFF97316)
+            "Language" -> ComposeColor(0xFF0A84FF); "Currency" -> ComposeColor(0xFF30D158)
+            "Notifications" -> ComposeColor(0xFFFF3B30); "Security" -> ComposeColor(0xFF8E8E93); "Backup" -> ComposeColor(0xFF00C7BE)
+            "Etherscan API key" -> ComposeColor(0xFF5E5CE6); "Updates" -> ComposeColor(0xFFFF9F0A)
+            else -> ComposeColor(0xFFFF2D55)
         }
-        Box(
-            Modifier.size(36.dp).clip(RoundedCornerShape(10.dp)).background(tint.copy(alpha = 0.18f)),
-            contentAlignment = Alignment.Center,
-        ) {
-            when (title) {
-                "Notifications" -> Icon(Icons.Filled.Notifications, null, Modifier.size(20.dp), tint = tint)
-                "Security" -> Icon(Icons.Filled.Lock, null, Modifier.size(20.dp), tint = tint)
-                "Backup" -> Icon(Icons.Filled.Share, null, Modifier.size(20.dp), tint = tint)
-                "Etherscan API key" -> Icon(Icons.Filled.Build, null, Modifier.size(20.dp), tint = tint)
-                "Report a problem" -> Icon(Icons.Filled.Info, null, Modifier.size(20.dp), tint = tint)
-                "Updates" -> Icon(Icons.Filled.Refresh, null, Modifier.size(20.dp), tint = tint)
-                else -> Text(
-                    when (title) { "Appearance" -> "◐"; "Language" -> "Aa"; "Currency" -> "$"; else -> "↗" },
-                    style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = tint,
-                    fontSize = if (title == "Appearance") androidx.compose.ui.unit.TextUnit(20f, androidx.compose.ui.unit.TextUnitType.Sp) else androidx.compose.ui.unit.TextUnit.Unspecified,
-                )
-            }
+        when (title) {
+            "Notifications" -> IconTile(tint, Icons.Filled.Notifications)
+            "Security" -> IconTile(tint, Icons.Filled.Lock)
+            "Backup" -> IconTile(tint, Icons.Filled.Share)
+            "Etherscan API key" -> IconTile(tint, Icons.Filled.Build)
+            "Report a problem" -> IconTile(tint, Icons.Filled.Info)
+            "Updates" -> IconTile(tint, Icons.Filled.Refresh)
+            else -> IconTile(tint, glyph = when (title) { "Language" -> "Aa"; "Currency" -> "$"; else -> "↗" })
         }
         Spacer(Modifier.width(14.dp))
         Text(tr(title), style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))

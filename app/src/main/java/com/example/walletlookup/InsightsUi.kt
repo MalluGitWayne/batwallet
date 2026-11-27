@@ -759,7 +759,7 @@ fun openInBrowser(context: android.content.Context, url: String) {
 @Composable
 fun DirectionIcon(symbol: String, incoming: Boolean) {
     // The arrow is drawn (not a text character), so it sits exactly in the middle of its badge.
-    val ring = MaterialTheme.colorScheme.surfaceContainerHighest
+    val ring = MaterialTheme.colorScheme.surfaceVariant
     Box(Modifier.size(38.dp)) {
         Box(Modifier.align(Alignment.TopStart)) { CoinIcon(symbol, 34.dp) }
         androidx.compose.foundation.Canvas(Modifier.align(Alignment.BottomEnd).size(18.dp)) {
