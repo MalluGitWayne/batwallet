@@ -31,26 +31,30 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * Exchange badges: the exchange's mark where a freely licensed one exists (Simple Icons, CC0: Binance, OKX, KuCoin;
- * the CC0 coin set's exchange tokens: HTX, Bitfinex), otherwise a monogram in its brand colours. Marks are shown only
- * to identify the exchange.
+ * Exchange badges: the exchange's own logo (see licenses/Logos.txt), otherwise a monogram in its brand colours.
+ * Logos are trademarks of their owners, shown only to identify the exchange.
  */
 private class Brand(val bg: Color, val fg: Color, val letters: String, val mark: Int? = null, val image: Int? = null)
 
 private val BRANDS = mapOf(
     "Binance" to Brand(Color(0xFF1E2026), Color(0xFFF0B90B), "B", mark = R.drawable.exch_binance),
-    "Bybit" to Brand(Color(0xFF17181E), Color(0xFFF7A600), "BY"),
+    "Bybit" to Brand(Color(0xFF17181E), Color(0xFFF7A600), "BY", image = R.drawable.exch_bybit),
     "OKX" to Brand(Color(0xFF000000), Color.White, "OKX", mark = R.drawable.exch_okx),
-    "Coinbase" to Brand(Color(0xFF0052FF), Color.White, "C"),
-    "Kraken" to Brand(Color(0xFF5741D9), Color.White, "K"),
+    "Coinbase" to Brand(Color(0xFF0052FF), Color.White, "C", image = R.drawable.exch_coinbase),
+    "Kraken" to Brand(Color(0xFF5741D9), Color.White, "K", image = R.drawable.exch_kraken),
     "KuCoin" to Brand(Color(0xFF23AF91), Color.White, "KC", mark = R.drawable.exch_kucoin),
     "Bitfinex" to Brand(Color(0xFF16B157), Color.White, "BF", image = R.drawable.exch_bitfinex),
-    "Gemini" to Brand(Color(0xFF00DCFA), Color(0xFF0B0B0B), "G"),
+    "Gemini" to Brand(Color(0xFF00DCFA), Color(0xFF0B0B0B), "G", image = R.drawable.exch_gemini),
     "HTX" to Brand(Color(0xFF2B66F6), Color.White, "HTX", image = R.drawable.exch_htx),
-    "Gate.io" to Brand(Color(0xFF2354E6), Color.White, "G"),
-    "Crypto.com" to Brand(Color(0xFF103F68), Color.White, "CR"),
-    "MEXC" to Brand(Color(0xFF1972F5), Color.White, "M"),
-    "Bitget" to Brand(Color(0xFF00F0FF), Color(0xFF0B0B0B), "BG"),
+    "Gate.io" to Brand(Color(0xFF2354E6), Color.White, "G", image = R.drawable.exch_gate),
+    "Crypto.com" to Brand(Color(0xFF103F68), Color.White, "CR", image = R.drawable.exch_cryptocom),
+    "MEXC" to Brand(Color(0xFF1972F5), Color.White, "M", image = R.drawable.exch_mexc),
+    "Bitget" to Brand(Color(0xFF00F0FF), Color(0xFF0B0B0B), "BG", image = R.drawable.exch_bitget),
+    "BingX" to Brand(Color(0xFF2A54FF), Color.White, "BX", image = R.drawable.exch_bingx),
+    "BitMart" to Brand(Color(0xFF111111), Color.White, "BM", image = R.drawable.exch_bitmart),
+    "Upbit" to Brand(Color(0xFF093687), Color.White, "UP", image = R.drawable.exch_upbit),
+    "WazirX" to Brand(Color(0xFF3067F0), Color.White, "WX", image = R.drawable.exch_wazirx),
+    "CoinDCX" to Brand(Color(0xFFFFFFFF), Color(0xFF2E7CF6), "CD", image = R.drawable.exch_coindcx),
 )
 
 /** Brand colours for folders named after an exchange or wallet app (matched anywhere in the name, any case). */

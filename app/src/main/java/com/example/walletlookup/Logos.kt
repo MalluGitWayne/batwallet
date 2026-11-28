@@ -24,7 +24,7 @@ import androidx.compose.ui.unit.sp
 val InGreen = Color(0xFF2EBD85)
 val OutRed = Color(0xFFF6465D)
 
-/** Coin logos from the public-domain (CC0) "cryptocurrency-icons" set. */
+/** Coin logos: the public-domain (CC0) "cryptocurrency-icons" set, plus a few networks' from Trust Wallet's assets. */
 private fun coinRes(symbol: String): Int? = when (symbol.uppercase().replace("â‚®", "T")) {
     "BTC" -> R.drawable.coin_btc
     "ETH" -> R.drawable.coin_eth
@@ -54,19 +54,17 @@ private fun coinRes(symbol: String): Int? = when (symbol.uppercase().replace("â‚
     "UNI" -> R.drawable.coin_uni
     "TON" -> R.drawable.coin_ton
     "APT" -> R.drawable.coin_apt
+    "NEAR" -> R.drawable.coin_near
+    "CELO" -> R.drawable.coin_celo
+    "S" -> R.drawable.coin_sonic
+    "ARB" -> R.drawable.coin_arbitrum
+    "OP" -> R.drawable.coin_optimism
+    "BASE" -> R.drawable.coin_base
     else -> null
 }
 
-/** Coins without an icon in the set get a circle in their brand colour with an initial. */
-private fun fallback(symbol: String): Pair<Color, String> = when (symbol.uppercase()) {
-    "NEAR" -> Color(0xFF00C08B) to "N"
-    "CELO" -> Color(0xFFFCD34D) to "C"
-    "S" -> Color(0xFF1C1C1C) to "S"
-    "ARB" -> Color(0xFF28A0F0) to "A"
-    "OP" -> Color(0xFFFF0420) to "OP"
-    "BASE" -> Color(0xFF0052FF) to "B"
-    else -> Color(0xFF8A8A8A) to symbol.take(1).uppercase()
-}
+/** Coins without a logo (an unknown token) get a grey circle with an initial. */
+private fun fallback(symbol: String): Pair<Color, String> = Color(0xFF8A8A8A) to symbol.take(1).uppercase()
 
 /** The coin that stands for a network (its logo is used as the network's logo). */
 fun networkSymbol(network: String): String = when (network) {
@@ -109,7 +107,7 @@ fun CoinIcon(symbol: String, size: Dp = 28.dp) {
     } else {
         val (color, letter) = fallback(symbol)
         Box(Modifier.size(size).clip(CircleShape).background(color), contentAlignment = Alignment.Center) {
-            Text(letter, color = if (color == Color(0xFFFCD34D)) Color.Black else Color.White,
+            Text(letter, color = Color.White,
                 fontWeight = FontWeight.Bold, fontSize = (size.value * 0.42f).sp)
         }
     }
@@ -134,7 +132,7 @@ fun drawCoinLogo(context: Context, c: Canvas, symbol: String, cx: Float, cy: Flo
     c.drawCircle(cx, cy, r, Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = android.graphics.Color.argb(255,
         (color.red * 255).toInt(), (color.green * 255).toInt(), (color.blue * 255).toInt()) })
     val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        this.color = if (color == Color(0xFFFCD34D)) android.graphics.Color.BLACK else android.graphics.Color.WHITE; textSize = r * 0.9f; textAlign = Paint.Align.CENTER; isFakeBoldText = true
+        this.color = android.graphics.Color.WHITE; textSize = r * 0.9f; textAlign = Paint.Align.CENTER; isFakeBoldText = true
     }
     c.drawText(letter, cx, cy + r * 0.32f, text)
 }

@@ -534,15 +534,15 @@ private fun TransferRow(t: Transfer, network: String, names: Map<String, String>
     val other = t.counterparty
     val saved = other?.let { names.labelFor(it, network) }
     val twin = other?.takeIf { saved == null }?.let(::lookalikeOf)
-    val exchange = other?.let { knownPlatform(it) }
+    val exchange = exchangeFor(other, saved)
     Card(Modifier.fillMaxWidth().clickable(onClick = onClick)) {
         Row(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
             DirectionIcon(t.symbol, t.incoming)
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    // A confirmed exchange on the other side gets its badge (direction: the coin's ↓ / ↑ and the colour).
-                    if (saved == null && exchange != null) {
+                    // An exchange on the other side gets its badge, also when it's under your own name for it.
+                    if (exchange != null) {
                         ExchangeBadge(exchange, 18.dp)
                         Spacer(Modifier.width(6.dp))
                     }
@@ -629,7 +629,7 @@ internal fun TransactionScreen(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(tr(label) + (tag?.let { " · $it" } ?: ""), style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    knownPlatform(addr)?.takeIf { named == null }?.let {
+                    exchangeFor(addr, named)?.let {
                         Spacer(Modifier.width(6.dp))
                         ExchangeBadge(it, 16.dp)
                     }

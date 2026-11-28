@@ -59,4 +59,14 @@ class ReviewFixesTest {
         // A transfer from before the last check doesn't belong to this change.
         assertEquals(0, pickTransfers(list + t(true, "5", since - 3 * h), change + BigDecimal("5"), now, since).size)
     }
+
+    @Test fun anExchangeIsRecognisedByItsWalletOrByYourLabel() {
+        assertEquals("Binance", exchangeFor("0x8894E0a0c962CB723c1976a4421c95949bE2D4E3"))
+        assertEquals("HTX", exchangeFor("0xab5C66752a9e8167967685F1450532fB96d5d24f"))
+        val stranger = "0x1111111111111111111111111111111111111111"
+        assertEquals("Bybit", exchangeFor(stranger, "My Bybit"))
+        assertEquals("Binance", exchangeFor(stranger, "Binance · deposit"))
+        assertEquals(null, exchangeFor(stranger, "Gateway shop"))
+        assertEquals(null, exchangeFor(stranger, null))
+    }
 }

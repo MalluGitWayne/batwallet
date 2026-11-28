@@ -581,16 +581,21 @@ object Alerts {
                 // Each payment as (amount, details): "+700.00 USDT" and "USDT on TON · 23:30" (coins also give the coin
                 // amount: "9.2636 TRX on Tron · 19:49"). Only the wallet's saved name is shown, never its address.
                 val clock = java.time.format.DateTimeFormatter.ofPattern("HH:mm").withZone(java.time.ZoneId.systemDefault())
+                // Which exchange it came from or went to (only the exchange's name, never an address).
+                val names = nameLabels(store.loadAddresses())
+                fun via(t: Transfer?, net: String, incoming: Boolean): String =
+                    exchangeFor(t?.counterparty, t?.counterparty?.let { names.labelFor(it, net) })
+                        ?.let { " · " + fromTo(incoming, it) } ?: ""
                 val payments = shown.flatMap { (key, diff) ->
                     val (sym, net) = key.split("|", limit = 2)
                     val coin = !sym.uppercase().startsWith("USD")
-                    fun line(amount: BigDecimal, at: Long) =
+                    fun line(amount: BigDecimal, at: Long, other: Transfer?) =
                         ((if (amount.signum() > 0) "+" else "−") + transferValue(amount.abs(), sym)) to
-                            ((if (coin) "${fmt(amount.abs())} $sym" else sym) + " " + tr("on") + " $net · " + clock.format(java.time.Instant.ofEpochMilli(at)))
+                            ((if (coin) "${fmt(amount.abs())} $sym" else sym) + " " + tr("on") + " $net · " + clock.format(java.time.Instant.ofEpochMilli(at)) + via(other, net, amount.signum() > 0))
                     // Several payments found behind one change (after a gap): each one, not their difference.
                     parts[key]?.filter { !exchange || it.incoming }?.takeIf { it.isNotEmpty() }
-                        ?.map { t -> line(if (t.incoming) t.amount else t.amount.negate(), t.time.takeIf { it > 0 } ?: now) }
-                        ?: listOf(line(diff, matches[key]?.time?.takeIf { it > 0 } ?: now))
+                        ?.map { t -> line(if (t.incoming) t.amount else t.amount.negate(), t.time.takeIf { it > 0 } ?: now, t) }
+                        ?: listOf(line(diff, matches[key]?.time?.takeIf { it > 0 } ?: now, matches[key] ?: coins[key]))
                 }
                 // Payments at or above the "big payment" amount use a louder channel and say so.
                 val bigMin = store.bigPayment

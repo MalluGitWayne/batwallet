@@ -189,7 +189,7 @@ fun RecentTxSection(
                                     style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold, color = OutRed)
                             }
                             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                                unnamed?.let(::knownPlatform)?.let {
+                                exchangeFor(t.counterparty, named)?.let {
                                     ExchangeBadge(it, 16.dp)
                                     Spacer(Modifier.width(6.dp))
                                 }

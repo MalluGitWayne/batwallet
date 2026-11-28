@@ -1,0 +1,10 @@
+Logos in app/src/main/res/drawable*:
+
+- coin_arbitrum, coin_base, coin_celo, coin_near, coin_optimism, coin_sonic: Trust Wallet assets
+  (github.com/trustwallet/assets), MIT License, Copyright (c) Trust Wallet.
+- exch_bingx, exch_bitget, exch_bitmart, exch_bybit, exch_coinbase, exch_coindcx, exch_cryptocom, exch_gate,
+  exch_gemini, exch_kraken, exch_mexc, exch_upbit, exch_wazirx:
+  from CoinGecko's image server. These are the trademarks of their owners, not freely licensed art; they are
+  shown only to identify the exchange. Batwallet isn't affiliated with or endorsed by any of them.
+- Other coin_* logos: cryptocurrency-icons (CC0). exch_binance, exch_kucoin, exch_okx: Simple Icons (CC0).
+  exch_bitfinex, exch_htx: the CC0 coin set's exchange tokens.

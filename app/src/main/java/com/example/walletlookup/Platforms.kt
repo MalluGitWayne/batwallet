@@ -132,6 +132,17 @@ private val EXCHANGE_NAMES = mapOf(
     "bitmart" to "BitMart", "upbit" to "Upbit", "wazirx" to "WazirX", "coindcx" to "CoinDCX",
 )
 
+/**
+ * The exchange on the other side of a payment, for its logo: a known exchange wallet, or one you named after an
+ * exchange (a contact or wallet called "Bybit", or in a "Binance" folder; [label] is that name). Null otherwise:
+ * a guess is never shown as fact.
+ */
+fun exchangeFor(address: String?, label: String? = null): String? {
+    address?.let(::knownPlatform)?.let { return it.substringBefore(" (") }
+    val text = label?.lowercase() ?: return null
+    return EXCHANGES.firstOrNull { mentionsExchange(text, it) }?.let { EXCHANGE_NAMES[it] }
+}
+
 fun exchangeIdentity(address: String, platform: Platform?, folder: String = "", name: String = ""): ExchangeId? {
     knownPlatform(address)?.let { return ExchangeId(it, Attribution.CONFIRMED, ownWallet = true) }
     val text = "$folder $name".lowercase()
